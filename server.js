@@ -189,6 +189,10 @@ app.get("/insights", async (req, res) => {
   }
 });
 
+app.get("/insights", (req, res) => {
+  res.send("INSIGHTS ROUTE IS LIVE");
+});
+
 const port = process.env.PORT || 4242;
 
 app.listen(port, "0.0.0.0", () => {
