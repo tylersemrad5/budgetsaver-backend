@@ -146,7 +146,6 @@ app.get("/transactions", async (req, res) => {
 
 app.get("/insights", async (req, res) => {
   try {
-
     const userId = req.header("X-USER-ID") || "tyler_local_user";
     const saved = userTokens.get(userId);
 
@@ -157,40 +156,33 @@ app.get("/insights", async (req, res) => {
     const now = new Date();
     const start = new Date(now.getFullYear(), now.getMonth(), 1);
 
-    const start_date = start.toISOString().slice(0,10);
-    const end_date = now.toISOString().slice(0,10);
+    const start_date = start.toISOString().slice(0, 10);
+    const end_date = now.toISOString().slice(0, 10);
 
     const resp = await plaid.transactionsGet({
       access_token: saved.access_token,
       start_date,
       end_date,
+      options: { count: 250, offset: 0 },
     });
 
-    const transactions = resp.data.transactions;
+    const transactions = resp.data.transactions || [];
 
     let spent = 0;
-
     for (const tx of transactions) {
-      if (tx.amount > 0) {
-        spent += tx.amount;
-      }
+      if (tx.amount > 0) spent += tx.amount;
     }
 
     res.json({
-      month: end_date.slice(0,7),
+      month: end_date.slice(0, 7),
       total_transactions: transactions.length,
-      spent: spent.toFixed(2),
-      transactions
+      spent: Number(spent.toFixed(2)),
+      transactions,
     });
-
   } catch (err) {
     console.error(err?.response?.data || err.message);
     res.status(500).json({ error: "Failed to generate insights" });
   }
-});
-
-app.get("/insights", (req, res) => {
-  res.send("INSIGHTS ROUTE IS LIVE");
 });
 
 const port = process.env.PORT || 4242;
