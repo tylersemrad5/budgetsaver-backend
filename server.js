@@ -3,6 +3,17 @@ import cors from "cors";
 import dotenv from "dotenv";
 import { Configuration, PlaidApi, PlaidEnvironments } from "plaid";
 
+function getCategory(tx) {
+  // Newer Plaid field:
+  const pfc = tx.personal_finance_category;
+  if (pfc?.primary) return pfc.primary; // e.g. "FOOD_AND_DRINK"
+
+  // Older Plaid field:
+  if (Array.isArray(tx.category) && tx.category.length > 0) return tx.category[0]; // e.g. "Food and Drink"
+
+  return "Other";
+}
+
 dotenv.config();
 
 const app = express();
@@ -222,17 +233,29 @@ app.get("/insights", async (req, res) => {
 
     // Compute spend (positive amounts only)
     let spentTotal = 0;
-    const spentByCategory = {};
-    for (const k of Object.keys(MONTHLY_BUDGETS)) spentByCategory[k] = 0;
+const spentByCategory = {};
 
-    for (const tx of transactions) {
-      if (tx.amount > 0) {
-        spentTotal += tx.amount;
-        const cat = categorize(tx);
-        if (!(cat in spentByCategory)) spentByCategory[cat] = 0;
-        spentByCategory[cat] += tx.amount;
-      }
-    }
+for (const tx of transactions) {
+
+  if (typeof tx.amount !== "number") continue;
+  if (tx.amount <= 0) continue;
+
+  spentTotal += tx.amount;
+
+  let category = "Other";
+
+  if (tx.personal_finance_category?.primary) {
+    category = tx.personal_finance_category.primary;
+  } else if (Array.isArray(tx.category) && tx.category.length > 0) {
+    category = tx.category[0];
+  }
+
+  if (!spentByCategory[category]) {
+    spentByCategory[category] = 0;
+  }
+
+  spentByCategory[category] += tx.amount;
+}
 
     const budgetByCategory = { ...MONTHLY_BUDGETS };
     const remainingByCategory = {};
