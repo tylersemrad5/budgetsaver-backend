@@ -176,8 +176,8 @@ app.get("/insights", async (req, res) => {
     res.json({
       month: end_date.slice(0, 7),
       total_transactions: transactions.length,
-      spent: Number(spent.toFixed(2)),
-      transactions,
+      spent: spent.toFixed(2),
+      transactions
     });
   } catch (err) {
     console.error(err?.response?.data || err.message);
