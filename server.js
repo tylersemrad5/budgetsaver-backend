@@ -215,11 +215,12 @@ app.get("/insights", async (req, res) => {
       return res.status(401).json({ error: "No bank connected" });
     }
 
-    const now = new Date();
-    const start = new Date(now.getFullYear(), now.getMonth(), 1);
+    const end = new Date();
+    const start = new Date();
+    start.setDate(end.getDate() - 30);
 
-    const start_date = ymd(start);
-    const end_date = ymd(now);
+    const start_date = (req.query.start_date ?? start.toISOString().slice(0, 10));
+    const end_date = (req.query.end_date     ?? end.toISOString().slice(0, 10));
 
     // Fetch this month
     const resp = await plaid.transactionsGet({
