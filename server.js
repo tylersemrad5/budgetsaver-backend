@@ -213,25 +213,18 @@ app.get("/transactions_by_month", async (req, res) => {
     const userId = req.header("X-USER-ID") || "tyler_local_user";
     const saved = userTokens.get(userId);
 
-    // ✅ If no bank connected, don't 500 — return 401 with a clear message
-    if (!saved?.access_token && (!Array.isArray(accessTokens) || accessTokens.length === 0)) {
+    if (!saved?.access_token) {
       return res.status(401).json({ error: "No bank connected. Connect bank first." });
     }
 
-    const tokensToUse = saved?.access_token ? [saved.access_token] : accessTokens;
+    const resp = await plaid.transactionsGet({
+      access_token: saved.access_token,
+      start_date,
+      end_date,
+      options: { count: 500, offset: 0 },
+    });
 
-    let all = [];
-
-    for (const access_token of tokensToUse) {
-      const resp = await plaid.transactionsGet({
-        access_token,
-        start_date,
-        end_date,
-        options: { count: 500, offset: 0 },
-      });
-
-      all.push(...(resp.data.transactions || []));
-    }
+    const all = resp.data.transactions || [];
 
     const spentTx = all
       .filter((t) => typeof t.amount === "number" && t.amount > 0)
@@ -239,7 +232,7 @@ app.get("/transactions_by_month", async (req, res) => {
 
     const grouped = {};
     for (const tx of spentTx) {
-      const month = (tx.date || "").slice(0, 7); // "YYYY-MM"
+      const month = (tx.date || "").slice(0, 7);
       if (!month) continue;
 
       if (!grouped[month]) grouped[month] = [];
@@ -254,7 +247,7 @@ app.get("/transactions_by_month", async (req, res) => {
 
     const months = Object.keys(grouped).sort((a, b) => (a < b ? 1 : -1));
 
-    return res.json({
+    res.json({
       range: { start_date, end_date },
       months: months.map((m) => ({
         month: m,
@@ -266,11 +259,8 @@ app.get("/transactions_by_month", async (req, res) => {
       })),
     });
   } catch (err) {
-    // ✅ This prints the REAL reason in Render logs
     console.error("transactions_by_month error:", err?.response?.data || err?.message || err);
-
-    // ✅ Temporarily return details to help you debug
-    return res.status(500).json({
+    res.status(500).json({
       error: "Failed to fetch transactions by month",
       details: err?.response?.data || err?.message || String(err),
     });
