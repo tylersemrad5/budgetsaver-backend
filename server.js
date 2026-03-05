@@ -210,11 +210,14 @@ app.get("/transactions_by_month", async (req, res) => {
     const start_date = req.query.start_date || "2026-01-01";
     const end_date = req.query.end_date || new Date().toISOString().slice(0, 10);
 
-    // If you're using the per-user token storage:
     const userId = req.header("X-USER-ID") || "tyler_local_user";
     const saved = userTokens.get(userId);
 
-    // Fallback if you're still using accessTokens array:
+    // ✅ If no bank connected, don't 500 — return 401 with a clear message
+    if (!saved?.access_token && (!Array.isArray(accessTokens) || accessTokens.length === 0)) {
+      return res.status(401).json({ error: "No bank connected. Connect bank first." });
+    }
+
     const tokensToUse = saved?.access_token ? [saved.access_token] : accessTokens;
 
     let all = [];
@@ -230,15 +233,15 @@ app.get("/transactions_by_month", async (req, res) => {
       all.push(...(resp.data.transactions || []));
     }
 
-    // Only purchases / spending (Plaid uses positive for money out)
     const spentTx = all
       .filter((t) => typeof t.amount === "number" && t.amount > 0)
-      .sort((a, b) => (a.date < b.date ? 1 : -1)); // newest first
+      .sort((a, b) => (a.date < b.date ? 1 : -1));
 
     const grouped = {};
     for (const tx of spentTx) {
       const month = (tx.date || "").slice(0, 7); // "YYYY-MM"
       if (!month) continue;
+
       if (!grouped[month]) grouped[month] = [];
       grouped[month].push({
         id: tx.transaction_id,
@@ -251,7 +254,7 @@ app.get("/transactions_by_month", async (req, res) => {
 
     const months = Object.keys(grouped).sort((a, b) => (a < b ? 1 : -1));
 
-    res.json({
+    return res.json({
       range: { start_date, end_date },
       months: months.map((m) => ({
         month: m,
@@ -263,8 +266,14 @@ app.get("/transactions_by_month", async (req, res) => {
       })),
     });
   } catch (err) {
-    console.error(err?.response?.data || err.message);
-    res.status(500).json({ error: "Failed to fetch transactions by month" });
+    // ✅ This prints the REAL reason in Render logs
+    console.error("transactions_by_month error:", err?.response?.data || err?.message || err);
+
+    // ✅ Temporarily return details to help you debug
+    return res.status(500).json({
+      error: "Failed to fetch transactions by month",
+      details: err?.response?.data || err?.message || String(err),
+    });
   }
 });
 
