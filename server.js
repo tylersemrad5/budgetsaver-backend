@@ -205,6 +205,69 @@ app.get("/transactions", async (req, res) => {
   }
 });
 
+app.get("/transactions_by_month", async (req, res) => {
+  try {
+    const start_date = req.query.start_date || "2026-01-01";
+    const end_date = req.query.end_date || new Date().toISOString().slice(0, 10);
+
+    // If you're using the per-user token storage:
+    const userId = req.header("X-USER-ID") || "tyler_local_user";
+    const saved = userTokens.get(userId);
+
+    // Fallback if you're still using accessTokens array:
+    const tokensToUse = saved?.access_token ? [saved.access_token] : accessTokens;
+
+    let all = [];
+
+    for (const access_token of tokensToUse) {
+      const resp = await plaid.transactionsGet({
+        access_token,
+        start_date,
+        end_date,
+        options: { count: 500, offset: 0 },
+      });
+
+      all.push(...(resp.data.transactions || []));
+    }
+
+    // Only purchases / spending (Plaid uses positive for money out)
+    const spentTx = all
+      .filter((t) => typeof t.amount === "number" && t.amount > 0)
+      .sort((a, b) => (a.date < b.date ? 1 : -1)); // newest first
+
+    const grouped = {};
+    for (const tx of spentTx) {
+      const month = (tx.date || "").slice(0, 7); // "YYYY-MM"
+      if (!month) continue;
+      if (!grouped[month]) grouped[month] = [];
+      grouped[month].push({
+        id: tx.transaction_id,
+        name: tx.merchant_name || tx.name || "Unknown",
+        date: tx.date,
+        amount: tx.amount,
+        category: tx.personal_finance_category?.primary || "OTHER",
+      });
+    }
+
+    const months = Object.keys(grouped).sort((a, b) => (a < b ? 1 : -1));
+
+    res.json({
+      range: { start_date, end_date },
+      months: months.map((m) => ({
+        month: m,
+        totalSpent: Number(
+          grouped[m].reduce((sum, t) => sum + (t.amount || 0), 0).toFixed(2)
+        ),
+        count: grouped[m].length,
+        transactions: grouped[m],
+      })),
+    });
+  } catch (err) {
+    console.error(err?.response?.data || err.message);
+    res.status(500).json({ error: "Failed to fetch transactions by month" });
+  }
+});
+
 // Insights: current month totals + spending by category vs budgets
 app.get("/insights", async (req, res) => {
   try {
