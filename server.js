@@ -474,6 +474,154 @@ app.get("/ai_advice", async (req, res) => {
   }
 });
 
+app.post("/ask_budget", async (req, res) => {
+  try {
+    const userId = req.header("X-USER-ID") || "tyler_local_user";
+    const saved = userTokens.get(userId);
+
+    if (!saved?.access_token) {
+      return res.status(401).json({ error: "No bank connected" });
+    }
+
+    const question = (req.body?.question || "").toLowerCase().trim();
+
+    if (!question) {
+      return res.status(400).json({ error: "Missing question" });
+    }
+
+    const now = new Date();
+    const end_date = now.toISOString().slice(0, 10);
+
+    const startDate = new Date(now);
+    startDate.setDate(startDate.getDate() - 30);
+    const start_date = startDate.toISOString().slice(0, 10);
+
+    const resp = await plaid.transactionsGet({
+      access_token: saved.access_token,
+      start_date,
+      end_date,
+      options: { count: 500, offset: 0 },
+    });
+
+    const transactions = (resp.data.transactions || []).filter(
+      (t) => typeof t.amount === "number" && t.amount > 0
+    );
+
+    const getCategory = (tx) =>
+      tx.personal_finance_category?.primary ||
+      (Array.isArray(tx.category) && tx.category.length > 0 ? tx.category[0] : "OTHER");
+
+    const totalSpent = transactions.reduce((sum, t) => sum + t.amount, 0);
+
+    const categoryTotals = {};
+    const merchantTotals = {};
+
+    for (const tx of transactions) {
+      const category = getCategory(tx);
+      const merchant = (tx.merchant_name || tx.name || "Unknown").toLowerCase();
+
+      categoryTotals[category] = (categoryTotals[category] || 0) + tx.amount;
+      merchantTotals[merchant] = (merchantTotals[merchant] || 0) + tx.amount;
+    }
+
+    const topCategoryEntry =
+      Object.entries(categoryTotals).sort((a, b) => b[1] - a[1])[0] || ["OTHER", 0];
+
+    const topMerchantEntry =
+      Object.entries(merchantTotals).sort((a, b) => b[1] - a[1])[0] || ["unknown", 0];
+
+    let answer = "I couldn't understand that question yet. Try asking about your top spending category, a merchant like Uber, or whether you spent more this month.";
+
+    if (
+      question.includes("most") &&
+      (question.includes("spend") || question.includes("spent") || question.includes("category"))
+    ) {
+      answer = `Your top spending category in the last 30 days was ${topCategoryEntry[0]} at $${topCategoryEntry[1].toFixed(2)}.`;
+    } else if (question.includes("how much") && question.includes("food")) {
+      const foodTotal = Object.entries(categoryTotals)
+        .filter(([cat]) => cat.includes("FOOD") || cat.includes("DRINK"))
+        .reduce((sum, [, amt]) => sum + amt, 0);
+
+      answer = `You spent $${foodTotal.toFixed(2)} on food and drink in the last 30 days.`;
+    } else if (
+      question.includes("transport") ||
+      question.includes("uber") ||
+      question.includes("lyft")
+    ) {
+      const transportTotal = transactions
+        .filter((tx) => {
+          const merchant = (tx.merchant_name || tx.name || "").toLowerCase();
+          const category = getCategory(tx);
+          return (
+            merchant.includes("uber") ||
+            merchant.includes("lyft") ||
+            category.includes("TRANSPORT")
+          );
+        })
+        .reduce((sum, tx) => sum + tx.amount, 0);
+
+      answer = `You spent $${transportTotal.toFixed(2)} on transportation in the last 30 days.`;
+    } else if (question.includes("uber")) {
+      const uberTotal = transactions
+        .filter((tx) => (tx.merchant_name || tx.name || "").toLowerCase().includes("uber"))
+        .reduce((sum, tx) => sum + tx.amount, 0);
+
+      answer = `You spent $${uberTotal.toFixed(2)} on Uber in the last 30 days.`;
+    } else if (
+      question.includes("top merchant") ||
+      (question.includes("spent") && question.includes("where"))
+    ) {
+      answer = `Your top merchant in the last 30 days was ${topMerchantEntry[0]} at $${topMerchantEntry[1].toFixed(2)}.`;
+    } else if (question.includes("total")) {
+      answer = `You spent a total of $${totalSpent.toFixed(2)} in the last 30 days.`;
+    } else if (
+      question.includes("more this month") ||
+      question.includes("more than last month") ||
+      question.includes("compare")
+    ) {
+      const prevEnd = new Date(startDate);
+      prevEnd.setDate(prevEnd.getDate() - 1);
+      const prevEndStr = prevEnd.toISOString().slice(0, 10);
+
+      const prevStart = new Date(prevEnd);
+      prevStart.setDate(prevStart.getDate() - 30);
+      const prevStartStr = prevStart.toISOString().slice(0, 10);
+
+      const prevResp = await plaid.transactionsGet({
+        access_token: saved.access_token,
+        start_date: prevStartStr,
+        end_date: prevEndStr,
+        options: { count: 500, offset: 0 },
+      });
+
+      const prevTransactions = (prevResp.data.transactions || []).filter(
+        (t) => typeof t.amount === "number" && t.amount > 0
+      );
+
+      const prevTotal = prevTransactions.reduce((sum, t) => sum + t.amount, 0);
+
+      if (totalSpent > prevTotal) {
+        answer = `Yes. You spent $${(totalSpent - prevTotal).toFixed(2)} more in the last 30 days than the previous 30-day period.`;
+      } else if (totalSpent < prevTotal) {
+        answer = `No. You spent $${(prevTotal - totalSpent).toFixed(2)} less in the last 30 days than the previous 30-day period.`;
+      } else {
+        answer = `Your spending was almost exactly the same across the two periods.`;
+      }
+    }
+
+    res.json({
+      question,
+      answer,
+    });
+  } catch (err) {
+    console.error("ask_budget error:", err?.response?.data || err?.message || err);
+    res.status(500).json({
+      error: "Failed to answer budget question",
+      details: err?.response?.data || err?.message || String(err),
+    });
+  }
+});
+
 // --------------------
 // Start server (Render-friendly)
 // --------------------
