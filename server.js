@@ -536,7 +536,7 @@ app.post("/ask_budget", async (req, res) => {
       question.includes("most") &&
       (question.includes("spend") || question.includes("spent") || question.includes("category"))
     ) {
-      answer = `Your top spending category in the last 30 days was ${topCategoryEntry[0]} at $${topCategoryEntry[1].toFixed(2)}.`;
+      answer = `You spent the most on ${topCategoryEntry[0]}, totaling $${topCategoryEntry[1].toFixed(2)} in the last 30 days.`;
     } else if (question.includes("how much") && question.includes("food")) {
       const foodTotal = Object.entries(categoryTotals)
         .filter(([cat]) => cat.includes("FOOD") || cat.includes("DRINK"))
