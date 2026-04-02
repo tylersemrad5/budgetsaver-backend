@@ -12,10 +12,15 @@ function formatCategoryName(category) {
 }
 
 function getCategory(tx) {
-  return (
-    tx.personal_finance_category?.primary ||
-    (Array.isArray(tx.category) && tx.category.length > 0 ? tx.category[0] : "OTHER")
-  );
+  if (tx.personal_finance_category?.primary) {
+    return tx.personal_finance_category.primary;
+  }
+
+  if (Array.isArray(tx.category) && tx.category.length > 0) {
+    return tx.category[0];
+  }
+
+  return "OTHER";
 }
 
 function sumByCategory(transactions) {
