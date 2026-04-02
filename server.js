@@ -351,6 +351,129 @@ for (const tx of transactions) {
   }
 });
 
+app.get("/ai_advice", async (req, res) => {
+  try {
+    const userId = req.header("X-USER-ID") || "tyler_local_user";
+    const saved = userTokens.get(userId);
+
+    if (!saved?.access_token) {
+      return res.status(401).json({ error: "No bank connected" });
+    }
+
+    const now = new Date();
+
+    const currentEnd = now.toISOString().slice(0, 10);
+
+    const currentStartDate = new Date(now);
+    currentStartDate.setDate(currentStartDate.getDate() - 30);
+    const currentStart = currentStartDate.toISOString().slice(0, 10);
+
+    const previousEndDate = new Date(currentStartDate);
+    previousEndDate.setDate(previousEndDate.getDate() - 1);
+    const previousEnd = previousEndDate.toISOString().slice(0, 10);
+
+    const previousStartDate = new Date(previousEndDate);
+    previousStartDate.setDate(previousStartDate.getDate() - 30);
+    const previousStart = previousStartDate.toISOString().slice(0, 10);
+
+    const currentResp = await plaid.transactionsGet({
+      access_token: saved.access_token,
+      start_date: currentStart,
+      end_date: currentEnd,
+      options: { count: 500, offset: 0 },
+    });
+
+    const previousResp = await plaid.transactionsGet({
+      access_token: saved.access_token,
+      start_date: previousStart,
+      end_date: previousEnd,
+      options: { count: 500, offset: 0 },
+    });
+
+    const currentTransactions = (currentResp.data.transactions || []).filter(
+      (t) => typeof t.amount === "number" && t.amount > 0
+    );
+
+    const previousTransactions = (previousResp.data.transactions || []).filter(
+      (t) => typeof t.amount === "number" && t.amount > 0
+    );
+
+    const currentSpent = currentTransactions.reduce((sum, t) => sum + t.amount, 0);
+    const previousSpent = previousTransactions.reduce((sum, t) => sum + t.amount, 0);
+
+    const categoryTotals = {};
+    const merchantTotals = {};
+
+    for (const tx of currentTransactions) {
+      const category =
+        tx.personal_finance_category?.primary ||
+        (Array.isArray(tx.category) && tx.category.length > 0 ? tx.category[0] : "OTHER");
+
+      const merchant = tx.merchant_name || tx.name || "Unknown";
+
+      categoryTotals[category] = (categoryTotals[category] || 0) + tx.amount;
+      merchantTotals[merchant] = (merchantTotals[merchant] || 0) + tx.amount;
+    }
+
+    const topCategoryEntry =
+      Object.entries(categoryTotals).sort((a, b) => b[1] - a[1])[0] || ["OTHER", 0];
+
+    const topMerchantEntry =
+      Object.entries(merchantTotals).sort((a, b) => b[1] - a[1])[0] || ["Unknown", 0];
+
+    const topCategory = topCategoryEntry[0];
+    const topCategoryAmount = Number(topCategoryEntry[1].toFixed(2));
+
+    const topMerchant = topMerchantEntry[0];
+    const topMerchantAmount = Number(topMerchantEntry[1].toFixed(2));
+
+    let trendText = "about the same as";
+    if (currentSpent > previousSpent + 5) trendText = "higher than";
+    if (currentSpent < previousSpent - 5) trendText = "lower than";
+
+    const summary = `In the last 30 days, you spent $${currentSpent.toFixed(2)}. Your biggest spending category was ${topCategory} at $${topCategoryAmount.toFixed(2)}. Your spending was ${trendText} the previous 30-day period.`;
+
+    const tips = [];
+
+    if (topCategoryAmount > currentSpent * 0.4) {
+      tips.push(`Most of your spending came from ${topCategory}. Setting a category limit here could help the most.`);
+    }
+
+    if (topMerchant !== "Unknown") {
+      tips.push(`Your top merchant was ${topMerchant} at $${topMerchantAmount.toFixed(2)}.`);
+    }
+
+    if (currentSpent > previousSpent + 5) {
+      tips.push(`You spent $${(currentSpent - previousSpent).toFixed(2)} more than the previous 30 days.`);
+    } else if (currentSpent < previousSpent - 5) {
+      tips.push(`You spent $${(previousSpent - currentSpent).toFixed(2)} less than the previous 30 days.`);
+    } else {
+      tips.push(`Your spending is staying pretty consistent month to month.`);
+    }
+
+    if (tips.length === 0) {
+      tips.push("Your spending pattern looks steady right now.");
+    }
+
+    res.json({
+      summary,
+      tips,
+      currentSpent: Number(currentSpent.toFixed(2)),
+      previousSpent: Number(previousSpent.toFixed(2)),
+      topCategory,
+      topCategoryAmount,
+      topMerchant,
+      topMerchantAmount,
+    });
+  } catch (err) {
+    console.error("ai_advice error:", err?.response?.data || err?.message || err);
+    res.status(500).json({
+      error: "Failed to generate AI advice",
+      details: err?.response?.data || err?.message || String(err),
+    });
+  }
+});
+
 // --------------------
 // Start server (Render-friendly)
 // --------------------
