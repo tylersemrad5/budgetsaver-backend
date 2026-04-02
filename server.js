@@ -3,30 +3,6 @@ import cors from "cors";
 import dotenv from "dotenv";
 import { Configuration, PlaidApi, PlaidEnvironments } from "plaid";
 
-function getCategory(tx) {
-  // Newer Plaid field:
-  const pfc = tx.personal_finance_category;
-  if (pfc?.primary) return pfc.primary; // e.g. "FOOD_AND_DRINK"
-
-  // Older Plaid field:
-  if (Array.isArray(tx.category) && tx.category.length > 0) return tx.category[0]; // e.g. "Food and Drink"
-
-  return "Other";
-}
-
-dotenv.config();
-
-const app = express();
-app.use(cors({ origin: true }));
-app.use(express.json());
-
-// --------------------
-// Simple "user" identity
-// --------------------
-function getUserId(req) {
-  return req.header("X-USER-ID") || "tyler_local_user";
-}
-
 function formatCategoryName(category) {
   return (category || "Other")
     .toLowerCase()
@@ -62,6 +38,25 @@ function sumByMerchant(transactions) {
   }
 
   return totals;
+}
+
+  // Older Plaid field:
+  if (Array.isArray(tx.category) && tx.category.length > 0) return tx.category[0]; // e.g. "Food and Drink"
+
+  return "Other";
+}
+
+dotenv.config();
+
+const app = express();
+app.use(cors({ origin: true }));
+app.use(express.json());
+
+// --------------------
+// Simple "user" identity
+// --------------------
+function getUserId(req) {
+  return req.header("X-USER-ID") || "tyler_local_user";
 }
 
 // In-memory storage (fine for sandbox/testing; resets on deploy)
