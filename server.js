@@ -1023,32 +1023,59 @@ app.post("/exchange_public_token", async (req, res) => {
     const accessToken = exchangeResponse.data.access_token;
     const itemId = exchangeResponse.data.item_id;
 
-    const itemGetResponse = await plaidClient.itemGet({
-      access_token: accessToken,
-    });
+    let institutionId = null;
+    let institutionName = "Connected Bank";
 
-    const institutionId = itemGetResponse.data.item.institution_id || null;
-    const institutionName = itemGetResponse.data.item.institution_name || null;
+    try {
+      const itemGetResponse = await plaidClient.itemGet({
+        access_token: accessToken,
+      });
+
+      institutionId = itemGetResponse.data.item?.institution_id || null;
+    } catch (err) {
+      console.error("itemGet warning:", err?.response?.data || err?.message || err);
+    }
+
+    if (institutionId) {
+      try {
+        const instResponse = await plaidClient.institutionsGetById({
+          institution_id: institutionId,
+          country_codes: ["US"],
+        });
+
+        institutionName =
+          instResponse.data.institution?.name || "Connected Bank";
+      } catch (err) {
+        console.error("institutionsGetById warning:", err?.response?.data || err?.message || err);
+      }
+    }
 
     await saveUserItem(userId, accessToken, itemId, institutionId, institutionName);
 
-    const accountsResponse = await plaidClient.accountsGet({
-      access_token: accessToken,
-    });
+    let accounts = [];
+    try {
+      const accountsResponse = await plaidClient.accountsGet({
+        access_token: accessToken,
+      });
 
-    await replaceAccountsForItem(
-      userId,
-      itemId,
-      institutionName,
-      accountsResponse.data.accounts || []
-    );
+      accounts = accountsResponse.data.accounts || [];
+
+      await replaceAccountsForItem(
+        userId,
+        itemId,
+        institutionName,
+        accounts
+      );
+    } catch (err) {
+      console.error("accountsGet warning:", err?.response?.data || err?.message || err);
+    }
 
     res.json({
       ok: true,
       item_id: itemId,
       institution_id: institutionId,
       institution_name: institutionName,
-      accounts_count: accountsResponse.data.accounts?.length || 0,
+      accounts_count: accounts.length,
     });
   } catch (err) {
     console.error("exchange_public_token error:", err?.response?.data || err?.message || err);
