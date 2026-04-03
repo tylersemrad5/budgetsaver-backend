@@ -1,3 +1,4 @@
+import OpenAI from "openai";
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -26,6 +27,10 @@ const plaid = new PlaidApi(config);
 
 // In-memory user token store
 const userTokens = new Map();
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 // ---------- Helpers ----------
 
@@ -732,6 +737,54 @@ app.post("/ask_budget", async (req, res) => {
       error: "Failed to answer budget question",
       details: err?.response?.data || err?.message || String(err),
     });
+  }
+});
+
+app.post("/ask_budget_ai", async (req, res) => {
+  try {
+    const { question, transactions } = req.body;
+
+    if (!transactions || transactions.length === 0) {
+      return res.json({
+        answer: "No transaction data available yet. Connect your bank first.",
+      });
+    }
+
+    const formatted = transactions
+      .slice(0, 50)
+      .map(
+        (t) =>
+          `${t.name} | $${t.amount} | ${t.category?.[0] || "Other"}`
+      )
+      .join("\n");
+
+    const prompt = `
+You are a smart financial assistant for a budgeting app called BudgetSaver.
+
+User question:
+${question}
+
+Here are their recent transactions:
+${formatted}
+
+Give helpful, personalized financial advice.
+Be specific. Keep it simple and useful.
+`;
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "You are a helpful budgeting assistant." },
+        { role: "user", content: prompt },
+      ],
+    });
+
+    res.json({
+      answer: completion.choices[0].message.content,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "AI failed" });
   }
 });
 
