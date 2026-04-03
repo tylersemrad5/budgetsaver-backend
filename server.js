@@ -2,14 +2,13 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import plaid from "plaid";
+import pg from "pg";
+import OpenAI from "openai";
 
 dotenv.config();
 
-const {
-  Configuration,
-  PlaidApi,
-  PlaidEnvironments,
-} = plaid;
+const { Configuration, PlaidApi, PlaidEnvironments } = plaid;
+const { Pool } = pg;
 
 const app = express();
 app.use(cors());
@@ -43,10 +42,33 @@ const plaidConfig = new Configuration({
 const plaidClient = new PlaidApi(plaidConfig);
 
 // =========================
-// Temporary in-memory token store
-// Replace with DB later for production
+// Database
 // =========================
-const userTokens = new Map();
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+});
+
+async function initDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS plaid_items (
+      user_id TEXT PRIMARY KEY,
+      access_token TEXT NOT NULL,
+      item_id TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  console.log("Database initialized");
+}
+
+// =========================
+// OpenAI
+// =========================
+const openai = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
 
 // =========================
 // Helpers
@@ -76,6 +98,18 @@ function getPrevious30DayRange() {
 
   const start = new Date(end);
   start.setDate(start.getDate() - 30);
+
+  return {
+    start: formatDate(start),
+    end: formatDate(end),
+  };
+}
+
+function getDateRangeLastSixMonths() {
+  const end = new Date();
+  const start = new Date();
+  start.setMonth(end.getMonth() - 5);
+  start.setDate(1);
 
   return {
     start: formatDate(start),
@@ -156,6 +190,15 @@ function monthKeyFromDateString(dateString) {
   return `${year}-${month}`;
 }
 
+function monthDisplay(monthKey) {
+  const [year, month] = monthKey.split("-");
+  const date = new Date(Number(year), Number(month) - 1, 1);
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    year: "numeric",
+  }).format(date);
+}
+
 function buildTransactionsByMonth(transactions, start, end) {
   const groups = {};
 
@@ -190,6 +233,23 @@ function buildTransactionsByMonth(transactions, start, end) {
   };
 }
 
+function buildMonthlyTrend(transactions) {
+  const grouped = {};
+
+  for (const tx of transactions) {
+    const key = monthKeyFromDateString(tx.date);
+    grouped[key] = (grouped[key] || 0) + tx.amount;
+  }
+
+  return Object.entries(grouped)
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([month, totalSpent]) => ({
+      month,
+      label: monthDisplay(month),
+      totalSpent: Number(totalSpent.toFixed(2)),
+    }));
+}
+
 function findRecurringCharges(transactions) {
   const grouped = {};
 
@@ -214,6 +274,146 @@ function findRecurringCharges(transactions) {
   }
 
   return recurring.sort((a, b) => b.total - a.total).slice(0, 10);
+}
+
+function buildBudgetScore(currentSpent, previousSpent, recurringCharges, topCategoryAmount) {
+  let score = 100;
+
+  if (currentSpent > previousSpent) {
+    score -= Math.min(20, Math.round((currentSpent - previousSpent) / 10));
+  }
+
+  if (recurringCharges.length >= 3) {
+    score -= 10;
+  }
+
+  if (currentSpent > 0 && topCategoryAmount > currentSpent * 0.5) {
+    score -= 10;
+  }
+
+  return Math.max(35, Math.min(100, score));
+}
+
+function buildSavingsOpportunities(topCategories, recurringCharges) {
+  const opportunities = [];
+
+  if (topCategories[0]) {
+    opportunities.push({
+      title: `Reduce ${topCategories[0].name}`,
+      amount: Number((topCategories[0].amount * 0.15).toFixed(2)),
+      message: `Cutting 15% from ${topCategories[0].name} could save about $${(
+        topCategories[0].amount * 0.15
+      ).toFixed(2)}.`,
+    });
+  }
+
+  if (recurringCharges[0]) {
+    opportunities.push({
+      title: `Review ${recurringCharges[0].merchant}`,
+      amount: recurringCharges[0].average,
+      message: `${recurringCharges[0].merchant} appears recurring. Reviewing it could save about $${recurringCharges[0].average.toFixed(
+        2
+      )} per cycle.`,
+    });
+  }
+
+  return opportunities.slice(0, 3);
+}
+
+function buildActionItems(currentSpent, previousSpent, topCategories, recurringCharges) {
+  const items = [];
+
+  if (currentSpent > previousSpent) {
+    items.push("Your spending is up from the previous period. Review your largest category first.");
+  }
+
+  if (topCategories[0]) {
+    items.push(`Your biggest category is ${topCategories[0].name}. That is the fastest place to cut.`);
+  }
+
+  if (recurringCharges.length > 0) {
+    items.push(`You have ${recurringCharges.length} recurring charge pattern(s). Review subscriptions and repeated services.`);
+  }
+
+  if (items.length === 0) {
+    items.push("Your spending is stable. Keep tracking your top categories to stay on target.");
+  }
+
+  return items.slice(0, 4);
+}
+
+function buildRiskFlags(currentSpent, previousSpent, topCategories, recurringCharges) {
+  const flags = [];
+
+  if (currentSpent > previousSpent * 1.2 && previousSpent > 0) {
+    flags.push("Spending increased sharply versus the prior 30 days.");
+  }
+
+  if (topCategories[0] && currentSpent > 0 && topCategories[0].amount > currentSpent * 0.5) {
+    flags.push(`More than half of your spending is concentrated in ${topCategories[0].name}.`);
+  }
+
+  if (recurringCharges.length >= 3) {
+    flags.push("Several recurring charges were detected.");
+  }
+
+  return flags;
+}
+
+function buildActionableMessages(currentTransactions, previousTransactions) {
+  const currentSpent = currentTransactions.reduce((sum, t) => sum + t.amount, 0);
+  const previousSpent = previousTransactions.reduce((sum, t) => sum + t.amount, 0);
+  const currentCategories = sumByCategory(currentTransactions);
+  const previousCategories = sumByCategory(previousTransactions);
+  const currentMerchants = sumByMerchant(currentTransactions);
+
+  const messages = [];
+
+  const topCategory = topEntries(currentCategories, 1)[0];
+  if (topCategory) {
+    messages.push({
+      title: `${topCategory.name} is your biggest category`,
+      message: `You spent $${topCategory.amount.toFixed(2)} on ${topCategory.name}. This is the fastest category to target if you want quick savings.`,
+      impact: "high",
+      suggestedAction: `Try cutting ${topCategory.name} by 10–15% this month.`,
+    });
+  }
+
+  const topMerchant = topEntries(currentMerchants, 1)[0];
+  if (topMerchant) {
+    messages.push({
+      title: `${topMerchant.name} is your top merchant`,
+      message: `Your highest merchant spend was $${topMerchant.amount.toFixed(2)} with ${topMerchant.name}.`,
+      impact: "medium",
+      suggestedAction: `Review whether that merchant reflects a habit you want to change.`,
+    });
+  }
+
+  if (currentSpent > previousSpent) {
+    const increase = currentSpent - previousSpent;
+    messages.push({
+      title: "Your spending increased",
+      message: `You spent $${increase.toFixed(2)} more than the previous 30-day period.`,
+      impact: "high",
+      suggestedAction: "Check the category and merchant sections to see what changed.",
+    });
+  }
+
+  for (const [category, amount] of Object.entries(currentCategories)) {
+    const prev = previousCategories[category] || 0;
+    const change = percentChange(amount, prev);
+
+    if (amount >= 50 && change >= 25) {
+      messages.push({
+        title: `${category} is rising`,
+        message: `You spent $${amount.toFixed(2)} on ${category}, up ${change}% from the prior period.`,
+        impact: "medium",
+        suggestedAction: `Watch your ${category} spending over the next 2 weeks.`,
+      });
+    }
+  }
+
+  return messages.slice(0, 5);
 }
 
 function buildRuleInsights(currentTransactions, previousTransactions) {
@@ -289,7 +489,7 @@ function buildRuleInsights(currentTransactions, previousTransactions) {
     });
   }
 
-  if (topCategory && topCategory.amount >= currentSpent * 0.45) {
+  if (topCategory && currentSpent > 0 && topCategory.amount >= currentSpent * 0.45) {
     insights.push({
       type: "concentration",
       title: "Spending is concentrated",
@@ -301,7 +501,7 @@ function buildRuleInsights(currentTransactions, previousTransactions) {
   return insights.slice(0, 6);
 }
 
-function buildMoneyInsights(currentTransactions, previousTransactions) {
+function buildMoneyInsights(currentTransactions, previousTransactions, sixMonthTransactions) {
   const currentSpent = currentTransactions.reduce((sum, t) => sum + t.amount, 0);
   const previousSpent = previousTransactions.reduce((sum, t) => sum + t.amount, 0);
 
@@ -309,7 +509,6 @@ function buildMoneyInsights(currentTransactions, previousTransactions) {
   const merchantTotals = sumByMerchant(currentTransactions);
   const recurringCharges = findRecurringCharges(currentTransactions);
   const insights = buildRuleInsights(currentTransactions, previousTransactions);
-
   const topCategories = topEntries(categoryTotals, 5);
   const topMerchants = topEntries(merchantTotals, 5);
 
@@ -319,20 +518,6 @@ function buildMoneyInsights(currentTransactions, previousTransactions) {
     previousSpent,
     recurringCharges,
     topCategoryAmount
-  );
-
-  const savingsOpportunities = buildSavingsOpportunities(topCategories, recurringCharges);
-  const actionItems = buildActionItems(
-    currentSpent,
-    previousSpent,
-    topCategories,
-    recurringCharges
-  );
-  const riskFlags = buildRiskFlags(
-    currentSpent,
-    previousSpent,
-    topCategories,
-    recurringCharges
   );
 
   return {
@@ -347,9 +532,21 @@ function buildMoneyInsights(currentTransactions, previousTransactions) {
     topMerchants,
     recurringCharges,
     insights,
-    savingsOpportunities,
-    actionItems,
-    riskFlags,
+    actionableMessages: buildActionableMessages(currentTransactions, previousTransactions),
+    savingsOpportunities: buildSavingsOpportunities(topCategories, recurringCharges),
+    actionItems: buildActionItems(
+      currentSpent,
+      previousSpent,
+      topCategories,
+      recurringCharges
+    ),
+    riskFlags: buildRiskFlags(
+      currentSpent,
+      previousSpent,
+      topCategories,
+      recurringCharges
+    ),
+    monthlyTrend: buildMonthlyTrend(sixMonthTransactions),
   };
 }
 
@@ -365,7 +562,7 @@ function buildBudgetAIResponse(question, moneyInsights) {
 
   let answer = "";
   let suggestions = [];
-  let score = 70;
+  let score = moneyInsights.budgetScore || 70;
 
   if (q.includes("wasting") || q.includes("waste")) {
     answer = topCategory
@@ -377,11 +574,23 @@ function buildBudgetAIResponse(question, moneyInsights) {
       : "I don't have enough spending data yet to identify waste areas.";
 
     suggestions = [
-      "What subscriptions should I cut?",
-      "What did I spend the most on?",
-      "Did I spend more than last month?"
+      "What should I cut first?",
+      "Show my recurring charges",
+      "How much could I save this month?"
     ];
-    score = 62;
+  } else if (q.includes("save") || q.includes("saving")) {
+    if (moneyInsights.savingsOpportunities.length > 0) {
+      const topOpportunity = moneyInsights.savingsOpportunities[0];
+      answer = `Your best near-term savings move is **${topOpportunity.title}**. ${topOpportunity.message}`;
+    } else {
+      answer = "I don't have a strong savings recommendation yet. Keep tracking your top categories.";
+    }
+
+    suggestions = [
+      "What category is hurting me most?",
+      "Show my biggest merchant",
+      "Did my spending increase?"
+    ];
   } else if (q.includes("biggest expense") || q.includes("top category")) {
     answer = topCategory
       ? `Your top spending category is **${topCategory.name}** at **$${topCategory.amount.toFixed(2)}** in the last 30 days.`
@@ -389,10 +598,9 @@ function buildBudgetAIResponse(question, moneyInsights) {
 
     suggestions = [
       "Where am I wasting money?",
-      "What was my biggest merchant?",
-      "Show recurring charges"
+      "What should I cut first?",
+      "Show my top merchants"
     ];
-    score = 72;
   } else if (q.includes("merchant")) {
     answer = topMerchant
       ? `Your biggest merchant spend was **${topMerchant.name}** at **$${topMerchant.amount.toFixed(2)}**.`
@@ -400,10 +608,9 @@ function buildBudgetAIResponse(question, moneyInsights) {
 
     suggestions = [
       "What did I spend the most on?",
-      "Where am I wasting money?",
+      "Show recurring charges",
       "Did I spend more than last month?"
     ];
-    score = 70;
   } else if (q.includes("subscription") || q.includes("recurring")) {
     if (moneyInsights.recurringCharges.length === 0) {
       answer = "I did not detect recurring charges in the last 30 days.";
@@ -421,23 +628,9 @@ function buildBudgetAIResponse(question, moneyInsights) {
 
     suggestions = [
       "Which recurring charge is biggest?",
-      "Where am I wasting money?",
-      "How can I save more?"
+      "How much could I save?",
+      "Where am I wasting money?"
     ];
-    score = 68;
-  } else if (q.includes("save") || q.includes("saving")) {
-    answer = topCategory
-      ? `The fastest way to save more is to reduce **${topCategory.name}**, your largest category at **$${topCategory.amount.toFixed(2)}**. ${
-          topMerchant ? `Your biggest merchant was **${topMerchant.name}**.` : ""
-        } Start with the biggest category first.`
-      : "I need more transaction data before I can suggest savings areas.";
-
-    suggestions = [
-      "Where am I wasting money?",
-      "Break down my subscriptions",
-      "Did I spend more than last month?"
-    ];
-    score = 74;
   } else if (
     q.includes("more than last month") ||
     q.includes("spend more") ||
@@ -451,9 +644,20 @@ function buildBudgetAIResponse(question, moneyInsights) {
     suggestions = [
       "What category increased the most?",
       "Where am I wasting money?",
-      "How can I save more?"
+      "What should I cut first?"
     ];
-    score = 73;
+  } else if (q.includes("budget score") || q.includes("score")) {
+    answer = `Your current **Budget Score** is **${moneyInsights.budgetScore}/100**. ${
+      moneyInsights.riskFlags.length > 0
+        ? `The biggest issues are: ${moneyInsights.riskFlags.join(" ")}`
+        : "Your spending pattern looks fairly stable right now."
+    }`;
+
+    suggestions = [
+      "How can I improve my score?",
+      "What should I cut first?",
+      "Show my savings opportunities"
+    ];
   } else {
     const insightLines = moneyInsights.insights
       .slice(0, 3)
@@ -464,9 +668,8 @@ function buildBudgetAIResponse(question, moneyInsights) {
     suggestions = [
       "Where am I wasting money?",
       "What did I spend the most on?",
-      "Break down my subscriptions"
+      "How much could I save?"
     ];
-    score = 70;
   }
 
   return {
@@ -474,6 +677,48 @@ function buildBudgetAIResponse(question, moneyInsights) {
     suggestions,
     score,
   };
+}
+
+// =========================
+// Token storage
+// =========================
+async function saveUserToken(userId, accessToken, itemId) {
+  await pool.query(
+    `
+    INSERT INTO plaid_items (user_id, access_token, item_id, updated_at)
+    VALUES ($1, $2, $3, NOW())
+    ON CONFLICT (user_id)
+    DO UPDATE SET
+      access_token = EXCLUDED.access_token,
+      item_id = EXCLUDED.item_id,
+      updated_at = NOW()
+    `,
+    [userId, accessToken, itemId]
+  );
+}
+
+async function getUserToken(userId) {
+  const result = await pool.query(
+    `
+    SELECT user_id, access_token, item_id
+    FROM plaid_items
+    WHERE user_id = $1
+    LIMIT 1
+    `,
+    [userId]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function deleteUserToken(userId) {
+  await pool.query(
+    `
+    DELETE FROM plaid_items
+    WHERE user_id = $1
+    `,
+    [userId]
+  );
 }
 
 async function getTransactions(accessToken, startDate, endDate) {
@@ -500,86 +745,6 @@ async function getTransactions(accessToken, startDate, endDate) {
   }
 
   return all;
-}
-
-function buildBudgetScore(currentSpent, previousSpent, recurringCharges, topCategoryAmount) {
-  let score = 100;
-
-  if (currentSpent > previousSpent) {
-    score -= Math.min(20, Math.round((currentSpent - previousSpent) / 10));
-  }
-
-  if (recurringCharges.length >= 3) {
-    score -= 10;
-  }
-
-  if (topCategoryAmount > currentSpent * 0.5) {
-    score -= 10;
-  }
-
-  return Math.max(35, Math.min(100, score));
-}
-
-function buildSavingsOpportunities(topCategories, recurringCharges) {
-  const opportunities = [];
-
-  if (topCategories[0]) {
-    opportunities.push({
-      title: `Reduce ${topCategories[0].name}`,
-      amount: Number((topCategories[0].amount * 0.15).toFixed(2)),
-      message: `Cutting 15% from ${topCategories[0].name} could save about $${(topCategories[0].amount * 0.15).toFixed(2)}.`,
-    });
-  }
-
-  if (recurringCharges[0]) {
-    opportunities.push({
-      title: `Review ${recurringCharges[0].merchant}`,
-      amount: recurringCharges[0].average,
-      message: `${recurringCharges[0].merchant} appears recurring. Reviewing it could save about $${recurringCharges[0].average.toFixed(2)} per cycle.`,
-    });
-  }
-
-  return opportunities.slice(0, 3);
-}
-
-function buildActionItems(currentSpent, previousSpent, topCategories, recurringCharges) {
-  const items = [];
-
-  if (currentSpent > previousSpent) {
-    items.push("Your spending is up from the previous period. Review your largest category first.");
-  }
-
-  if (topCategories[0]) {
-    items.push(`Your biggest category is ${topCategories[0].name}. That is the fastest place to cut.`);
-  }
-
-  if (recurringCharges.length > 0) {
-    items.push(`You have ${recurringCharges.length} recurring charge pattern(s). Review subscriptions and repeated services.`);
-  }
-
-  if (items.length === 0) {
-    items.push("Your spending is stable. Keep tracking your top categories to stay on target.");
-  }
-
-  return items.slice(0, 4);
-}
-
-function buildRiskFlags(currentSpent, previousSpent, topCategories, recurringCharges) {
-  const flags = [];
-
-  if (currentSpent > previousSpent * 1.2 && previousSpent > 0) {
-    flags.push("Spending increased sharply versus the prior 30 days.");
-  }
-
-  if (topCategories[0] && topCategories[0].amount > currentSpent * 0.5) {
-    flags.push(`More than half of your spending is concentrated in ${topCategories[0].name}.`);
-  }
-
-  if (recurringCharges.length >= 3) {
-    flags.push("Several recurring charges were detected.");
-  }
-
-  return flags;
 }
 
 // =========================
@@ -639,10 +804,7 @@ app.post("/exchange_public_token", async (req, res) => {
     const accessToken = response.data.access_token;
     const itemId = response.data.item_id;
 
-    userTokens.set(userId, {
-      access_token: accessToken,
-      item_id: itemId,
-    });
+    await saveUserToken(userId, accessToken, itemId);
 
     res.json({
       ok: true,
@@ -657,10 +819,28 @@ app.post("/exchange_public_token", async (req, res) => {
   }
 });
 
+app.post("/disconnect_bank", async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const saved = await getUserToken(userId);
+
+    if (!saved) {
+      return res.status(404).json({ error: "No connected bank found." });
+    }
+
+    await deleteUserToken(userId);
+
+    res.json({ ok: true, message: "Bank disconnected." });
+  } catch (err) {
+    console.error("disconnect_bank error:", err?.message || err);
+    res.status(500).json({ error: "Failed to disconnect bank." });
+  }
+});
+
 app.get("/alerts", async (req, res) => {
   try {
     const userId = getUserId(req);
-    const saved = userTokens.get(userId);
+    const saved = await getUserToken(userId);
 
     if (!saved?.access_token) {
       return res.status(401).json({ error: "No bank connected." });
@@ -724,7 +904,7 @@ app.get("/alerts", async (req, res) => {
 app.get("/insights", async (req, res) => {
   try {
     const userId = getUserId(req);
-    const saved = userTokens.get(userId);
+    const saved = await getUserToken(userId);
 
     if (!saved?.access_token) {
       return res.status(401).json({ error: "No bank connected." });
@@ -773,7 +953,7 @@ app.get("/insights", async (req, res) => {
 app.get("/transactions_by_month", async (req, res) => {
   try {
     const userId = getUserId(req);
-    const saved = userTokens.get(userId);
+    const saved = await getUserToken(userId);
 
     if (!saved?.access_token) {
       return res.status(401).json({ error: "No bank connected." });
@@ -799,10 +979,11 @@ app.get("/transactions_by_month", async (req, res) => {
   }
 });
 
+// 1 + 2 + 3 combined
 app.get("/money_insights", async (req, res) => {
   try {
     const userId = getUserId(req);
-    const saved = userTokens.get(userId);
+    const saved = await getUserToken(userId);
 
     if (!saved?.access_token) {
       return res.status(401).json({ error: "No bank connected." });
@@ -810,6 +991,7 @@ app.get("/money_insights", async (req, res) => {
 
     const currentRange = getDateRangeLast30Days();
     const previousRange = getPrevious30DayRange();
+    const sixMonthRange = getDateRangeLastSixMonths();
 
     const currentTransactions = (await getTransactions(
       saved.access_token,
@@ -823,7 +1005,17 @@ app.get("/money_insights", async (req, res) => {
       previousRange.end
     )).filter(isDebitLikeTransaction);
 
-    const insightData = buildMoneyInsights(currentTransactions, previousTransactions);
+    const sixMonthTransactions = (await getTransactions(
+      saved.access_token,
+      sixMonthRange.start,
+      sixMonthRange.end
+    )).filter(isDebitLikeTransaction);
+
+    const insightData = buildMoneyInsights(
+      currentTransactions,
+      previousTransactions,
+      sixMonthTransactions
+    );
 
     res.json(insightData);
   } catch (err) {
@@ -832,10 +1024,112 @@ app.get("/money_insights", async (req, res) => {
   }
 });
 
+// 4 AI recommendations endpoint
+app.get("/ai_recommendations", async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const saved = await getUserToken(userId);
+
+    if (!saved?.access_token) {
+      return res.status(401).json({ error: "No bank connected." });
+    }
+
+    const currentRange = getDateRangeLast30Days();
+    const previousRange = getPrevious30DayRange();
+    const sixMonthRange = getDateRangeLastSixMonths();
+
+    const currentTransactions = (await getTransactions(
+      saved.access_token,
+      currentRange.start,
+      currentRange.end
+    )).filter(isDebitLikeTransaction);
+
+    const previousTransactions = (await getTransactions(
+      saved.access_token,
+      previousRange.start,
+      previousRange.end
+    )).filter(isDebitLikeTransaction);
+
+    const sixMonthTransactions = (await getTransactions(
+      saved.access_token,
+      sixMonthRange.start,
+      sixMonthRange.end
+    )).filter(isDebitLikeTransaction);
+
+    const moneyInsights = buildMoneyInsights(
+      currentTransactions,
+      previousTransactions,
+      sixMonthTransactions
+    );
+
+    if (!openai) {
+      return res.json({
+        source: "rule_engine",
+        recommendations: moneyInsights.actionItems.map((item) => ({
+          title: "Recommended next step",
+          message: item,
+        })),
+      });
+    }
+
+    const prompt = `
+You are BudgetSaver AI, a practical personal finance coach.
+
+Use only the data provided.
+Do not invent numbers or merchants.
+Give 3 short, specific recommendations.
+Each recommendation should have:
+- title
+- message
+
+Return valid JSON in this exact format:
+{
+  "recommendations": [
+    { "title": "string", "message": "string" },
+    { "title": "string", "message": "string" },
+    { "title": "string", "message": "string" }
+  ]
+}
+
+Data:
+${JSON.stringify(moneyInsights, null, 2)}
+`;
+
+    const response = await openai.responses.create({
+      model: "gpt-5.4",
+      input: prompt,
+    });
+
+    const raw = response.output_text?.trim() || "{}";
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = {
+        recommendations: moneyInsights.actionItems.slice(0, 3).map((item) => ({
+          title: "Recommended next step",
+          message: item,
+        })),
+      };
+    }
+
+    res.json({
+      source: "openai",
+      recommendations: Array.isArray(parsed.recommendations)
+        ? parsed.recommendations.slice(0, 3)
+        : [],
+    });
+  } catch (err) {
+    console.error("ai_recommendations error:", err?.response?.data || err?.message || err);
+    res.status(500).json({ error: "Failed to build AI recommendations." });
+  }
+});
+
 app.post("/ask_budget_ai", async (req, res) => {
   try {
     const userId = getUserId(req);
-    const saved = userTokens.get(userId);
+    const saved = await getUserToken(userId);
     const question = String(req.body?.question || "").trim();
 
     if (!saved?.access_token) {
@@ -848,6 +1142,7 @@ app.post("/ask_budget_ai", async (req, res) => {
 
     const currentRange = getDateRangeLast30Days();
     const previousRange = getPrevious30DayRange();
+    const sixMonthRange = getDateRangeLastSixMonths();
 
     const currentTransactions = (await getTransactions(
       saved.access_token,
@@ -861,7 +1156,18 @@ app.post("/ask_budget_ai", async (req, res) => {
       previousRange.end
     )).filter(isDebitLikeTransaction);
 
-    const moneyInsights = buildMoneyInsights(currentTransactions, previousTransactions);
+    const sixMonthTransactions = (await getTransactions(
+      saved.access_token,
+      sixMonthRange.start,
+      sixMonthRange.end
+    )).filter(isDebitLikeTransaction);
+
+    const moneyInsights = buildMoneyInsights(
+      currentTransactions,
+      previousTransactions,
+      sixMonthTransactions
+    );
+
     const result = buildBudgetAIResponse(question, moneyInsights);
 
     res.json({
@@ -883,6 +1189,17 @@ app.post("/ask_budget_ai", async (req, res) => {
 // =========================
 // Start server
 // =========================
-app.listen(PORT, () => {
-  console.log(`BudgetSaver backend running on port ${PORT}`);
-});
+async function startServer() {
+  try {
+    await initDatabase();
+
+    app.listen(PORT, () => {
+      console.log(`BudgetSaver backend running on port ${PORT}`);
+    });
+  } catch (err) {
+    console.error("Failed to start server:", err);
+    process.exit(1);
+  }
+}
+
+startServer();
