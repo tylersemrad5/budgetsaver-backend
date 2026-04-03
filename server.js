@@ -97,32 +97,31 @@ function buildBudgetObjects(spentByCategory) {
   };
 }
 
+function formatDate(date) {
+  return date.toISOString().slice(0, 10);
+}
+
 function getDateRangeLast30Days() {
-  const now = new Date();
-  const end = now.toISOString().slice(0, 10);
+  const end = new Date();
+  const start = new Date();
+  start.setDate(end.getDate() - 30);
 
-  const startDate = new Date(now);
-  startDate.setDate(startDate.getDate() - 30);
-  const start = startDate.toISOString().slice(0, 10);
-
-  return { start, end };
+  return {
+    start: formatDate(start),
+    end: formatDate(end),
+  };
 }
 
 function getPrevious30DayRange() {
-  const now = new Date();
+  const end = new Date();
+  end.setDate(end.getDate() - 30);
 
-  const currentStartDate = new Date(now);
-  currentStartDate.setDate(currentStartDate.getDate() - 30);
-
-  const previousEndDate = new Date(currentStartDate);
-  previousEndDate.setDate(previousEndDate.getDate() - 1);
-
-  const previousStartDate = new Date(previousEndDate);
-  previousStartDate.setDate(previousStartDate.getDate() - 30);
+  const start = new Date(end);
+  start.setDate(end.getDate() - 30);
 
   return {
-    start: previousStartDate.toISOString().slice(0, 10),
-    end: previousEndDate.toISOString().slice(0, 10),
+    start: formatDate(start),
+    end: formatDate(end),
   };
 }
 
@@ -135,6 +134,198 @@ async function getTransactions(access_token, start_date, end_date) {
   });
 
   return resp.data.transactions || [];
+}
+
+function isDebitLikeTransaction(tx) {
+  return typeof tx.amount === "number" && tx.amount > 0;
+}
+
+function getCategory(tx) {
+  return (
+    tx.personal_finance_category?.primary ||
+    (Array.isArray(tx.category) && tx.category[0]) ||
+    "OTHER"
+  );
+}
+
+function formatCategoryName(raw) {
+  return String(raw)
+    .toLowerCase()
+    .split("_")
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+    .join(" ");
+}
+
+function normalizeMerchant(tx) {
+  return (tx.merchant_name || tx.name || "Unknown").trim();
+}
+
+function sumByCategory(transactions) {
+  const totals = {};
+  for (const tx of transactions) {
+    const category = formatCategoryName(getCategory(tx));
+    totals[category] = (totals[category] || 0) + tx.amount;
+  }
+  return totals;
+}
+
+function sumByMerchant(transactions) {
+  const totals = {};
+  for (const tx of transactions) {
+    const merchant = normalizeMerchant(tx);
+    totals[merchant] = (totals[merchant] || 0) + tx.amount;
+  }
+  return totals;
+}
+
+function findRecurringCharges(transactions) {
+  const grouped = {};
+
+  for (const tx of transactions) {
+    const merchant = normalizeMerchant(tx);
+    if (!grouped[merchant]) grouped[merchant] = [];
+    grouped[merchant].push(tx);
+  }
+
+  const recurring = [];
+
+  for (const [merchant, txs] of Object.entries(grouped)) {
+    if (txs.length < 2) continue;
+
+    const total = txs.reduce((sum, t) => sum + t.amount, 0);
+    recurring.push({
+      merchant,
+      count: txs.length,
+      total: Number(total.toFixed(2)),
+      average: Number((total / txs.length).toFixed(2)),
+    });
+  }
+
+  return recurring.sort((a, b) => b.total - a.total).slice(0, 10);
+}
+
+function percentChange(current, previous) {
+  if (!previous && !current) return 0;
+  if (!previous) return 100;
+  return Number((((current - previous) / previous) * 100).toFixed(1));
+}
+
+function topEntries(obj, limit = 5) {
+  return Object.entries(obj)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([name, amount]) => ({
+      name,
+      amount: Number(amount.toFixed(2)),
+    }));
+}
+
+function buildRuleInsights(currentTransactions, previousTransactions) {
+  const currentSpent = currentTransactions.reduce((sum, t) => sum + t.amount, 0);
+  const previousSpent = previousTransactions.reduce((sum, t) => sum + t.amount, 0);
+
+  const currentCategories = sumByCategory(currentTransactions);
+  const previousCategories = sumByCategory(previousTransactions);
+  const currentMerchants = sumByMerchant(currentTransactions);
+
+  const topCategory = topEntries(currentCategories, 1)[0] || null;
+  const topMerchant = topEntries(currentMerchants, 1)[0] || null;
+  const recurring = findRecurringCharges(currentTransactions);
+
+  const insights = [];
+
+  if (topCategory) {
+    insights.push({
+      type: "top_category",
+      title: `Top spending category: ${topCategory.name}`,
+      message: `${topCategory.name} was your biggest category at $${topCategory.amount.toFixed(2)} in the last 30 days.`,
+      priority: "high",
+    });
+  }
+
+  if (topMerchant) {
+    insights.push({
+      type: "top_merchant",
+      title: `Biggest merchant: ${topMerchant.name}`,
+      message: `Your highest spend with a single merchant was ${topMerchant.name} at $${topMerchant.amount.toFixed(2)}.`,
+      priority: "medium",
+    });
+  }
+
+  const overallChange = percentChange(currentSpent, previousSpent);
+  if (currentSpent > previousSpent) {
+    insights.push({
+      type: "spending_up",
+      title: "Spending increased",
+      message: `You spent $${currentSpent.toFixed(2)} in the last 30 days, up ${overallChange}% from the previous period.`,
+      priority: "high",
+    });
+  } else if (currentSpent < previousSpent) {
+    insights.push({
+      type: "spending_down",
+      title: "Spending decreased",
+      message: `You spent $${currentSpent.toFixed(2)} in the last 30 days, down ${Math.abs(overallChange)}% from the previous period.`,
+      priority: "good",
+    });
+  }
+
+  for (const [category, amount] of Object.entries(currentCategories)) {
+    const prev = previousCategories[category] || 0;
+    const change = percentChange(amount, prev);
+
+    if (amount >= 50 && change >= 30) {
+      insights.push({
+        type: "category_jump",
+        title: `${category} is trending up`,
+        message: `You spent $${amount.toFixed(2)} on ${category}, which is up ${change}% from the prior 30 days.`,
+        priority: "medium",
+      });
+    }
+  }
+
+  if (recurring.length > 0) {
+    const topRecurring = recurring[0];
+    insights.push({
+      type: "recurring",
+      title: "Recurring charges detected",
+      message: `You have recurring spending with ${topRecurring.merchant}. It appeared ${topRecurring.count} times and totaled $${topRecurring.total.toFixed(2)}.`,
+      priority: "medium",
+    });
+  }
+
+  if (topCategory && topCategory.amount >= currentSpent * 0.45) {
+    insights.push({
+      type: "concentration",
+      title: "Spending is concentrated",
+      message: `Nearly half of your spending came from ${topCategory.name}. Reducing that category would have the biggest impact.`,
+      priority: "high",
+    });
+  }
+
+  return insights.slice(0, 6);
+}
+
+function buildMoneyInsights(currentTransactions, previousTransactions) {
+  const currentSpent = currentTransactions.reduce((sum, t) => sum + t.amount, 0);
+  const previousSpent = previousTransactions.reduce((sum, t) => sum + t.amount, 0);
+
+  const categoryTotals = sumByCategory(currentTransactions);
+  const merchantTotals = sumByMerchant(currentTransactions);
+  const recurringCharges = findRecurringCharges(currentTransactions);
+  const insights = buildRuleInsights(currentTransactions, previousTransactions);
+
+  return {
+    summary: {
+      currentSpent: Number(currentSpent.toFixed(2)),
+      previousSpent: Number(previousSpent.toFixed(2)),
+      changePercent: percentChange(currentSpent, previousSpent),
+      transactionCount: currentTransactions.length,
+    },
+    topCategories: topEntries(categoryTotals, 5),
+    topMerchants: topEntries(merchantTotals, 5),
+    recurringCharges,
+    insights,
+  };
 }
 
 // ---------- Routes ----------
@@ -933,6 +1124,39 @@ ${JSON.stringify(context, null, 2)}
       ],
       source: "real_ai"
     });
+  }
+});
+
+app.get("/money_insights", async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const saved = userTokens.get(userId);
+
+    if (!saved?.access_token) {
+      return res.status(401).json({ error: "No bank connected." });
+    }
+
+    const currentRange = getDateRangeLast30Days();
+    const previousRange = getPrevious30DayRange();
+
+    const currentTransactions = (await getTransactions(
+      saved.access_token,
+      currentRange.start,
+      currentRange.end
+    )).filter(isDebitLikeTransaction);
+
+    const previousTransactions = (await getTransactions(
+      saved.access_token,
+      previousRange.start,
+      previousRange.end
+    )).filter(isDebitLikeTransaction);
+
+    const insightData = buildMoneyInsights(currentTransactions, previousTransactions);
+
+    res.json(insightData);
+  } catch (err) {
+    console.error("money_insights error:", err?.response?.data || err?.message || err);
+    res.status(500).json({ error: "Failed to build money insights." });
   }
 });
 
