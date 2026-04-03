@@ -742,49 +742,129 @@ app.post("/ask_budget", async (req, res) => {
 
 app.post("/ask_budget_ai", async (req, res) => {
   try {
-    const { question, transactions } = req.body;
+    const userId = getUserId(req);
+    const saved = userTokens.get(userId);
 
-    if (!transactions || transactions.length === 0) {
-      return res.json({
-        answer: "No transaction data available yet. Connect your bank first.",
-      });
+    if (!saved?.access_token) {
+      return res.status(401).json({ error: "No bank connected" });
     }
 
-    const formatted = transactions
-      .slice(0, 50)
-      .map(
-        (t) =>
-          `${t.name} | $${t.amount} | ${t.category?.[0] || "Other"}`
-      )
-      .join("\n");
+    const question = (req.body?.question || "").trim();
+
+    if (!question) {
+      return res.status(400).json({ error: "Missing question" });
+    }
+
+    const currentRange = getDateRangeLast30Days();
+    const previousRange = getPrevious30DayRange();
+
+    const currentTransactions = (await getTransactions(
+      saved.access_token,
+      currentRange.start,
+      currentRange.end
+    )).filter((t) => typeof t.amount === "number" && t.amount > 0);
+
+    const previousTransactions = (await getTransactions(
+      saved.access_token,
+      previousRange.start,
+      previousRange.end
+    )).filter((t) => typeof t.amount === "number" && t.amount > 0);
+
+    const currentSpent = currentTransactions.reduce((sum, t) => sum + t.amount, 0);
+    const previousSpent = previousTransactions.reduce((sum, t) => sum + t.amount, 0);
+
+    const categoryTotals = sumByCategory(currentTransactions);
+    const merchantTotals = sumByMerchant(currentTransactions);
+
+    const topCategoryEntry =
+      Object.entries(categoryTotals).sort((a, b) => b[1] - a[1])[0] || ["OTHER", 0];
+
+    const topMerchantEntry =
+      Object.entries(merchantTotals).sort((a, b) => b[1] - a[1])[0] || ["Unknown", 0];
+
+    const biggestTransaction =
+      currentTransactions.slice().sort((a, b) => b.amount - a.amount)[0] || null;
+
+    const recurringMerchantCounts = {};
+    for (const tx of currentTransactions) {
+      const merchant = (tx.merchant_name || tx.name || "Unknown").trim();
+      recurringMerchantCounts[merchant] = (recurringMerchantCounts[merchant] || 0) + 1;
+    }
+
+    const recurringMerchants = Object.entries(recurringMerchantCounts)
+      .filter(([, count]) => count >= 2)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5);
+
+    const compactTransactions = currentTransactions.slice(0, 40).map((tx) => ({
+      name: tx.merchant_name || tx.name || "Unknown",
+      amount: tx.amount,
+      date: tx.date,
+      category: formatCategoryName(getCategory(tx)),
+    }));
+
+    const context = {
+      currentPeriod: currentRange,
+      previousPeriod: previousRange,
+      currentSpent: Number(currentSpent.toFixed(2)),
+      previousSpent: Number(previousSpent.toFixed(2)),
+      topCategory: {
+        name: formatCategoryName(topCategoryEntry[0]),
+        amount: Number(topCategoryEntry[1].toFixed(2)),
+      },
+      topMerchant: {
+        name: topMerchantEntry[0],
+        amount: Number(topMerchantEntry[1].toFixed(2)),
+      },
+      biggestTransaction: biggestTransaction
+        ? {
+            name: biggestTransaction.merchant_name || biggestTransaction.name || "Unknown",
+            amount: Number(biggestTransaction.amount.toFixed(2)),
+            date: biggestTransaction.date,
+            category: formatCategoryName(getCategory(biggestTransaction)),
+          }
+        : null,
+      recurringMerchants: recurringMerchants.map(([merchant, count]) => ({
+        merchant,
+        count,
+      })),
+      recentTransactions: compactTransactions,
+    };
 
     const prompt = `
-You are a smart financial assistant for a budgeting app called BudgetSaver.
+You are BudgetSaver AI, a helpful personal finance assistant inside a budgeting app.
+
+Rules:
+- Use only the data provided.
+- Do not invent merchants, categories, or amounts.
+- Keep answers clear, useful, and short.
+- Give practical budgeting guidance when relevant.
+- Do not give investment, tax, legal, or lending advice.
+- If the user's question cannot be answered from the data, say that clearly.
 
 User question:
 ${question}
 
-Here are their recent transactions:
-${formatted}
-
-Give helpful, personalized financial advice.
-Be specific. Keep it simple and useful.
+Budget data:
+${JSON.stringify(context, null, 2)}
 `;
 
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: "You are a helpful budgeting assistant." },
-        { role: "user", content: prompt },
-      ],
+    const response = await openai.responses.create({
+      model: "gpt-5.4",
+      input: prompt,
     });
 
     res.json({
-      answer: completion.choices[0].message.content,
+      question,
+      answer: response.output_text?.trim() || "I couldn't generate an answer.",
+      source: "real_ai",
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "AI failed" });
+    console.error("ask_budget_ai error:", err?.response?.data || err?.message || err);
+    res.status(500).json({
+      error: "Failed to answer budget question with AI",
+      details: err?.response?.data || err?.message || String(err),
+    });
   }
 });
 
