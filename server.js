@@ -1186,6 +1186,23 @@ app.post("/ask_budget_ai", async (req, res) => {
   }
 });
 
+app.get("/connection_status", async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const saved = await getUserToken(userId);
+
+    res.json({
+      connected: !!saved?.access_token,
+      item_id: saved?.item_id || null,
+    });
+  } catch (err) {
+    console.error("connection_status error:", err?.message || err);
+    res.status(500).json({
+      error: "Failed to get connection status.",
+    });
+  }
+});
+
 // =========================
 // Start server
 // =========================
