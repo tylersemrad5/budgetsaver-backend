@@ -746,13 +746,33 @@ app.post("/ask_budget_ai", async (req, res) => {
     const saved = userTokens.get(userId);
 
     if (!saved?.access_token) {
-      return res.status(401).json({ error: "No bank connected" });
+      return res.status(401).json({
+        question: req.body?.question || "",
+        answer: "No bank connected yet. Connect your bank first.",
+        score: 0,
+        suggestions: [
+          "Connect my bank",
+          "Fetch my transactions",
+          "Show my spending alerts"
+        ],
+        source: "real_ai"
+      });
     }
 
     const question = (req.body?.question || "").trim();
 
     if (!question) {
-      return res.status(400).json({ error: "Missing question" });
+      return res.status(400).json({
+        question: "",
+        answer: "Please ask a question first.",
+        score: 0,
+        suggestions: [
+          "Where am I wasting money?",
+          "What is my biggest expense?",
+          "Am I overspending?"
+        ],
+        source: "real_ai"
+      });
     }
 
     const currentRange = getDateRangeLast30Days();
@@ -803,6 +823,15 @@ app.post("/ask_budget_ai", async (req, res) => {
       category: formatCategoryName(getCategory(tx)),
     }));
 
+    let score = 100;
+
+    if (currentSpent > previousSpent) score -= 10;
+    if (topCategoryEntry[1] > currentSpent * 0.5) score -= 15;
+    if (recurringMerchants.length > 0) score -= 5;
+    if (currentSpent > 300) score -= 10;
+
+    score = Math.max(0, Math.min(100, Math.round(score)));
+
     const context = {
       currentPeriod: currentRange,
       previousPeriod: previousRange,
@@ -840,7 +869,14 @@ Rules:
 - Keep answers clear, useful, and short.
 - Give practical budgeting guidance when relevant.
 - Do not give investment, tax, legal, or lending advice.
-- If the user's question cannot be answered from the data, say that clearly.
+- Focus on waste, overspending, recurring charges, trends, and one or two practical next steps.
+- Mention specific merchants when they clearly stand out.
+- Return valid JSON only.
+- The JSON must contain exactly:
+  {
+    "answer": string,
+    "suggestions": [string, string, string]
+  }
 
 User question:
 ${question}
@@ -854,16 +890,48 @@ ${JSON.stringify(context, null, 2)}
       input: prompt,
     });
 
-    res.json({
+    const raw = response.output_text?.trim() || "{}";
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = {
+        answer: raw || "I couldn't generate an answer.",
+        suggestions: [
+          "How can I cut back?",
+          "What is my biggest expense?",
+          "Am I overspending?"
+        ]
+      };
+    }
+
+    return res.json({
       question,
-      answer: response.output_text?.trim() || "I couldn't generate an answer.",
+      answer: parsed.answer || "I couldn't generate an answer.",
+      score,
+      suggestions: Array.isArray(parsed.suggestions)
+        ? parsed.suggestions.slice(0, 3)
+        : [
+            "How can I cut back?",
+            "What is my biggest expense?",
+            "Am I overspending?"
+          ],
       source: "real_ai",
     });
   } catch (err) {
     console.error("ask_budget_ai error:", err?.response?.data || err?.message || err);
-    res.status(500).json({
-      error: "Failed to answer budget question with AI",
-      details: err?.response?.data || err?.message || String(err),
+
+    return res.status(500).json({
+      question: req.body?.question || "",
+      answer: "AI is temporarily unavailable right now. Try again in a moment.",
+      score: 0,
+      suggestions: [
+        "What is my biggest expense?",
+        "Am I overspending?",
+        "Show my spending alerts"
+      ],
+      source: "real_ai"
     });
   }
 });
