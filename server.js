@@ -419,6 +419,116 @@ app.get("/ai_advice", async (req, res) => {
   }
 });
 
+app.get("/alerts", async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const saved = userTokens.get(userId);
+
+    if (!saved?.access_token) {
+      return res.status(401).json({ error: "No bank connected" });
+    }
+
+    const currentRange = getDateRangeLast30Days();
+    const previousRange = getPrevious30DayRange();
+
+    const currentTransactions = (await getTransactions(
+      saved.access_token,
+      currentRange.start,
+      currentRange.end
+    )).filter((t) => typeof t.amount === "number" && t.amount > 0);
+
+    const previousTransactions = (await getTransactions(
+      saved.access_token,
+      previousRange.start,
+      previousRange.end
+    )).filter((t) => typeof t.amount === "number" && t.amount > 0);
+
+    const currentSpent = currentTransactions.reduce((sum, t) => sum + t.amount, 0);
+    const previousSpent = previousTransactions.reduce((sum, t) => sum + t.amount, 0);
+
+    const categoryTotals = sumByCategory(currentTransactions);
+    const merchantTotals = sumByMerchant(currentTransactions);
+
+    const alerts = [];
+
+    const topCategoryEntry =
+      Object.entries(categoryTotals).sort((a, b) => b[1] - a[1])[0] || ["OTHER", 0];
+
+    const topCategory = topCategoryEntry[0];
+    const topCategoryAmount = topCategoryEntry[1];
+
+    if (currentSpent > 0 && topCategoryAmount / currentSpent >= 0.45) {
+      alerts.push({
+        type: "warning",
+        title: "Top category is dominating spending",
+        message: `${formatCategoryName(topCategory)} makes up ${((topCategoryAmount / currentSpent) * 100).toFixed(0)}% of your last 30 days of spending.`,
+      });
+    }
+
+    if (currentSpent > previousSpent + 15) {
+      alerts.push({
+        type: "warning",
+        title: "Spending increased",
+        message: `You spent $${(currentSpent - previousSpent).toFixed(2)} more than the previous 30-day period.`,
+      });
+    }
+
+    const uberLyftTotal = currentTransactions
+      .filter((tx) => {
+        const merchant = (tx.merchant_name || tx.name || "").toLowerCase();
+        return merchant.includes("uber") || merchant.includes("lyft");
+      })
+      .reduce((sum, tx) => sum + tx.amount, 0);
+
+    if (uberLyftTotal >= 20) {
+      alerts.push({
+        type: "info",
+        title: "Rideshare spending detected",
+        message: `You spent $${uberLyftTotal.toFixed(2)} on Uber/Lyft in the last 30 days.`,
+      });
+    }
+
+    const recurringMerchantCounts = {};
+    for (const tx of currentTransactions) {
+      const merchant = (tx.merchant_name || tx.name || "Unknown").trim();
+      recurringMerchantCounts[merchant] = (recurringMerchantCounts[merchant] || 0) + 1;
+    }
+
+    const recurringMerchants = Object.entries(recurringMerchantCounts)
+      .filter(([, count]) => count >= 2)
+      .sort((a, b) => b[1] - a[1]);
+
+    if (recurringMerchants.length > 0) {
+      const [merchant, count] = recurringMerchants[0];
+      alerts.push({
+        type: "info",
+        title: "Possible recurring charge",
+        message: `${merchant} appeared ${count} times in the last 30 days.`,
+      });
+    }
+
+    if (alerts.length === 0) {
+      alerts.push({
+        type: "good",
+        title: "No major alerts",
+        message: "Your recent spending looks pretty stable right now.",
+      });
+    }
+
+    res.json({
+      totalSpent: Number(currentSpent.toFixed(2)),
+      previousSpent: Number(previousSpent.toFixed(2)),
+      alerts,
+    });
+  } catch (err) {
+    console.error("alerts error:", err?.response?.data || err?.message || err);
+    res.status(500).json({
+      error: "Failed to generate alerts",
+      details: err?.response?.data || err?.message || String(err),
+    });
+  }
+});
+
 app.post("/ask_budget", async (req, res) => {
   try {
     const userId = getUserId(req);
