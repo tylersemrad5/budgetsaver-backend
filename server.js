@@ -310,6 +310,31 @@ function buildMoneyInsights(currentTransactions, previousTransactions) {
   const recurringCharges = findRecurringCharges(currentTransactions);
   const insights = buildRuleInsights(currentTransactions, previousTransactions);
 
+  const topCategories = topEntries(categoryTotals, 5);
+  const topMerchants = topEntries(merchantTotals, 5);
+
+  const topCategoryAmount = topCategories[0]?.amount || 0;
+  const budgetScore = buildBudgetScore(
+    currentSpent,
+    previousSpent,
+    recurringCharges,
+    topCategoryAmount
+  );
+
+  const savingsOpportunities = buildSavingsOpportunities(topCategories, recurringCharges);
+  const actionItems = buildActionItems(
+    currentSpent,
+    previousSpent,
+    topCategories,
+    recurringCharges
+  );
+  const riskFlags = buildRiskFlags(
+    currentSpent,
+    previousSpent,
+    topCategories,
+    recurringCharges
+  );
+
   return {
     summary: {
       currentSpent: Number(currentSpent.toFixed(2)),
@@ -317,10 +342,14 @@ function buildMoneyInsights(currentTransactions, previousTransactions) {
       changePercent: percentChange(currentSpent, previousSpent),
       transactionCount: currentTransactions.length,
     },
-    topCategories: topEntries(categoryTotals, 5),
-    topMerchants: topEntries(merchantTotals, 5),
+    budgetScore,
+    topCategories,
+    topMerchants,
     recurringCharges,
     insights,
+    savingsOpportunities,
+    actionItems,
+    riskFlags,
   };
 }
 
@@ -471,6 +500,86 @@ async function getTransactions(accessToken, startDate, endDate) {
   }
 
   return all;
+}
+
+function buildBudgetScore(currentSpent, previousSpent, recurringCharges, topCategoryAmount) {
+  let score = 100;
+
+  if (currentSpent > previousSpent) {
+    score -= Math.min(20, Math.round((currentSpent - previousSpent) / 10));
+  }
+
+  if (recurringCharges.length >= 3) {
+    score -= 10;
+  }
+
+  if (topCategoryAmount > currentSpent * 0.5) {
+    score -= 10;
+  }
+
+  return Math.max(35, Math.min(100, score));
+}
+
+function buildSavingsOpportunities(topCategories, recurringCharges) {
+  const opportunities = [];
+
+  if (topCategories[0]) {
+    opportunities.push({
+      title: `Reduce ${topCategories[0].name}`,
+      amount: Number((topCategories[0].amount * 0.15).toFixed(2)),
+      message: `Cutting 15% from ${topCategories[0].name} could save about $${(topCategories[0].amount * 0.15).toFixed(2)}.`,
+    });
+  }
+
+  if (recurringCharges[0]) {
+    opportunities.push({
+      title: `Review ${recurringCharges[0].merchant}`,
+      amount: recurringCharges[0].average,
+      message: `${recurringCharges[0].merchant} appears recurring. Reviewing it could save about $${recurringCharges[0].average.toFixed(2)} per cycle.`,
+    });
+  }
+
+  return opportunities.slice(0, 3);
+}
+
+function buildActionItems(currentSpent, previousSpent, topCategories, recurringCharges) {
+  const items = [];
+
+  if (currentSpent > previousSpent) {
+    items.push("Your spending is up from the previous period. Review your largest category first.");
+  }
+
+  if (topCategories[0]) {
+    items.push(`Your biggest category is ${topCategories[0].name}. That is the fastest place to cut.`);
+  }
+
+  if (recurringCharges.length > 0) {
+    items.push(`You have ${recurringCharges.length} recurring charge pattern(s). Review subscriptions and repeated services.`);
+  }
+
+  if (items.length === 0) {
+    items.push("Your spending is stable. Keep tracking your top categories to stay on target.");
+  }
+
+  return items.slice(0, 4);
+}
+
+function buildRiskFlags(currentSpent, previousSpent, topCategories, recurringCharges) {
+  const flags = [];
+
+  if (currentSpent > previousSpent * 1.2 && previousSpent > 0) {
+    flags.push("Spending increased sharply versus the prior 30 days.");
+  }
+
+  if (topCategories[0] && topCategories[0].amount > currentSpent * 0.5) {
+    flags.push(`More than half of your spending is concentrated in ${topCategories[0].name}.`);
+  }
+
+  if (recurringCharges.length >= 3) {
+    flags.push("Several recurring charges were detected.");
+  }
+
+  return flags;
 }
 
 // =========================
