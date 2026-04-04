@@ -64,20 +64,32 @@ async function initDatabase() {
   `);
 
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS plaid_accounts (
-      account_id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      item_id TEXT NOT NULL,
-      institution_name TEXT,
-      name TEXT,
-      official_name TEXT,
-      mask TEXT,
-      type TEXT,
-      subtype TEXT,
-      created_at TIMESTAMP DEFAULT NOW(),
-      updated_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
+  CREATE TABLE IF NOT EXISTS plaid_accounts (
+    account_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    institution_name TEXT,
+    name TEXT,
+    official_name TEXT,
+    mask TEXT,
+    type TEXT,
+    subtype TEXT,
+    current_balance DOUBLE PRECISION,
+    available_balance DOUBLE PRECISION,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+  );
+`);
+
+  await pool.query(`
+  ALTER TABLE plaid_accounts
+  ADD COLUMN IF NOT EXISTS current_balance DOUBLE PRECISION;
+`);
+
+await pool.query(`
+  ALTER TABLE plaid_accounts
+  ADD COLUMN IF NOT EXISTS available_balance DOUBLE PRECISION;
+`);
 
   console.log("Database initialized");
 }
@@ -945,9 +957,59 @@ async function deleteUserItem(userId, itemId) {
 
 async function replaceAccountsForItem(userId, itemId, institutionName, accounts) {
   await pool.query(
-    `DELETE FROM plaid_accounts WHERE user_id = $1 AND item_id = $2`,
+    `
+    DELETE FROM plaid_accounts WHERE user_id = $1 AND item_id = $2
+    `,
     [userId, itemId]
   );
+
+  for (const account of accounts) {
+    await pool.query(
+      `
+      INSERT INTO plaid_accounts (
+        account_id,
+        user_id,
+        item_id,
+        institution_name,
+        name,
+        official_name,
+        mask,
+        type,
+        subtype,
+        current_balance,
+        available_balance,
+        updated_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+      ON CONFLICT (account_id)
+      DO UPDATE SET
+        institution_name = EXCLUDED.institution_name,
+        name = EXCLUDED.name,
+        official_name = EXCLUDED.official_name,
+        mask = EXCLUDED.mask,
+        type = EXCLUDED.type,
+        subtype = EXCLUDED.subtype,
+        current_balance = EXCLUDED.current_balance,
+        available_balance = EXCLUDED.available_balance,
+        item_id = EXCLUDED.item_id,
+        updated_at = NOW()
+      `,
+      [
+        account.account_id,
+        userId,
+        itemId,
+        institutionName,
+        account.name || null,
+        account.official_name || null,
+        account.mask || null,
+        account.type || null,
+        account.subtype || null,
+        account.balances?.current ?? null,
+        account.balances?.available ?? null,
+      ]
+    );
+  }
+}
 
   for (const account of accounts) {
     await pool.query(
@@ -986,7 +1048,18 @@ async function getAccountsForUser(userId, selectedItemIds = null, selectedAccoun
   if (selectedAccountIds && selectedAccountIds.length > 0) {
     const result = await pool.query(
       `
-      SELECT account_id, user_id, item_id, institution_name, name, official_name, mask, type, subtype
+      SELECT
+        account_id,
+        user_id,
+        item_id,
+        institution_name,
+        name,
+        official_name,
+        mask,
+        type,
+        subtype,
+        current_balance,
+        available_balance
       FROM plaid_accounts
       WHERE user_id = $1 AND account_id = ANY($2::text[])
       ORDER BY institution_name ASC, name ASC
@@ -999,7 +1072,18 @@ async function getAccountsForUser(userId, selectedItemIds = null, selectedAccoun
   if (selectedItemIds && selectedItemIds.length > 0) {
     const result = await pool.query(
       `
-      SELECT account_id, user_id, item_id, institution_name, name, official_name, mask, type, subtype
+      SELECT
+        account_id,
+        user_id,
+        item_id,
+        institution_name,
+        name,
+        official_name,
+        mask,
+        type,
+        subtype,
+        current_balance,
+        available_balance
       FROM plaid_accounts
       WHERE user_id = $1 AND item_id = ANY($2::text[])
       ORDER BY institution_name ASC, name ASC
@@ -1011,7 +1095,18 @@ async function getAccountsForUser(userId, selectedItemIds = null, selectedAccoun
 
   const result = await pool.query(
     `
-    SELECT account_id, user_id, item_id, institution_name, name, official_name, mask, type, subtype
+    SELECT
+      account_id,
+      user_id,
+      item_id,
+      institution_name,
+      name,
+      official_name,
+      mask,
+      type,
+      subtype,
+      current_balance,
+      available_balance
     FROM plaid_accounts
     WHERE user_id = $1
     ORDER BY institution_name ASC, name ASC
@@ -1765,6 +1860,66 @@ app.post("/ask_budget_ai", async (req, res) => {
       error: "Failed to answer budget question.",
       details: err?.response?.data || err?.message || "Unknown error",
     });
+  }
+});
+
+app.get("/spending_by_account", async (req, res) => {
+  try {
+    const ctx = await requireSelectionOrAll(req, res);
+    if (!ctx) return;
+
+    const { userId, selectedItemIds, selectedAccountIds } = ctx;
+    const range = getDateRangeLast30Days();
+
+    const transactions = (await getTransactionsForUser(
+      userId,
+      range.start,
+      range.end,
+      selectedItemIds,
+      selectedAccountIds
+    )).filter(isDebitLikeTransaction);
+
+    const accounts = await getAccountsForUser(userId, selectedItemIds, selectedAccountIds);
+
+    const grouped = {};
+
+    for (const account of accounts) {
+      grouped[account.account_id] = {
+        account_id: account.account_id,
+        item_id: account.item_id,
+        institution_name: account.institution_name || "Connected Bank",
+        name: account.name || account.official_name || "Account",
+        mask: account.mask || null,
+        type: account.type || null,
+        subtype: account.subtype || null,
+        current_balance: account.current_balance ?? null,
+        available_balance: account.available_balance ?? null,
+        spent_30d: 0,
+        transaction_count: 0,
+      };
+    }
+
+    for (const tx of transactions) {
+      if (!grouped[tx.account_id]) continue;
+      grouped[tx.account_id].spent_30d += tx.amount;
+      grouped[tx.account_id].transaction_count += 1;
+    }
+
+    const accountsWithSpending = Object.values(grouped)
+      .map((account) => ({
+        ...account,
+        spent_30d: Number(account.spent_30d.toFixed(2)),
+      }))
+      .sort((a, b) => b.spent_30d - a.spent_30d);
+
+    res.json({
+      accounts: accountsWithSpending,
+      selectedItemCount: selectedItemIds?.length || null,
+      selectedAccountCount: selectedAccountIds?.length || null,
+    });
+  } catch (err) {
+    console.error("spending_by_account error:", err?.response?.data || err?.message || err);
+    res.status(500).json({ error: "Failed to build spending by account." });
   }
 });
 
