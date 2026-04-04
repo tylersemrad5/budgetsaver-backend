@@ -1499,6 +1499,20 @@ app.post("/ask_budget_ai", async (req, res) => {
   }
 });
 
+app.get("/reset_database", async (_req, res) => {
+  try {
+    await pool.query(`DROP TABLE IF EXISTS plaid_accounts`);
+    await pool.query(`DROP TABLE IF EXISTS plaid_items`);
+
+    await initDatabase();
+
+    res.json({ ok: true, message "Database reset complete" });
+  } catch (err) {
+    console.error("reset_database error:", err?.message || err);
+    res.status(500).json({ error: "Failed to reset database." });
+  }
+});
+
 // =========================
 // Start server
 // =========================
