@@ -1506,10 +1506,15 @@ app.get("/reset_database", async (_req, res) => {
 
     await initDatabase();
 
-    res.json({ ok: true, message "Database reset complete" });
+    res.json({
+      ok: true,
+      message: "Database reset complete"
+    });
   } catch (err) {
-    console.error("reset_database error:", err?.message || err);
-    res.status(500).json({ error: "Failed to reset database." });
+    console.error("RESET ERROR:", err);
+    res.status(500).json({
+      error: "Reset failed"
+    });
   }
 });
 
