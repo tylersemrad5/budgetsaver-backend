@@ -81,7 +81,7 @@ async function initDatabase() {
   );
 `);
 
-  await pool.query(`
+await pool.query(`
   ALTER TABLE plaid_accounts
   ADD COLUMN IF NOT EXISTS current_balance DOUBLE PRECISION;
 `);
