@@ -90,14 +90,14 @@ const openai = process.env.OPENAI_API_KEY
   : null;
 
 // =========================
-// Basic helpers
+// Request helpers
 // =========================
 function getUserId(req) {
   return req.header("X-USER-ID") || "tyler_local_user";
 }
 
-function getSelectedItemIds(req) {
-  const headerValue = req.header("X-SELECTED-ITEM-IDS");
+function parseHeaderList(req, headerName) {
+  const headerValue = req.header(headerName);
   if (!headerValue) return null;
 
   const ids = headerValue
@@ -108,6 +108,17 @@ function getSelectedItemIds(req) {
   return ids.length > 0 ? ids : null;
 }
 
+function getSelectedItemIds(req) {
+  return parseHeaderList(req, "X-SELECTED-ITEM-IDS");
+}
+
+function getSelectedAccountIds(req) {
+  return parseHeaderList(req, "X-SELECTED-ACCOUNT-IDS");
+}
+
+// =========================
+// Date helpers
+// =========================
 function formatDate(date) {
   return date.toISOString().slice(0, 10);
 }
@@ -179,6 +190,9 @@ function getCurrentMonthLabel() {
   }).format(new Date());
 }
 
+// =========================
+// Data helpers
+// =========================
 function isDebitLikeTransaction(tx) {
   return typeof tx.amount === "number" && tx.amount > 0;
 }
@@ -350,6 +364,9 @@ function findRecurringCharges(transactions) {
   return recurring.sort((a, b) => b.total - a.total).slice(0, 10);
 }
 
+// =========================
+// Insights engine
+// =========================
 function buildBudgetScore(currentSpent, previousSpent, recurringCharges, topCategoryAmount) {
   let score = 100;
 
@@ -723,6 +740,9 @@ function buildWeeklySummary(currentWeekTransactions, previousWeekTransactions) {
   };
 }
 
+// =========================
+// AI response helper
+// =========================
 function buildBudgetAIResponse(question, moneyInsights) {
   const q = question.toLowerCase();
 
@@ -853,7 +873,7 @@ function buildBudgetAIResponse(question, moneyInsights) {
 }
 
 // =========================
-// Database helpers
+// DB helpers
 // =========================
 async function saveUserItem(userId, accessToken, itemId, institutionId = null, institutionName = null) {
   await pool.query(
@@ -944,6 +964,7 @@ async function replaceAccountsForItem(userId, itemId, institutionName, accounts)
         mask = EXCLUDED.mask,
         type = EXCLUDED.type,
         subtype = EXCLUDED.subtype,
+        item_id = EXCLUDED.item_id,
         updated_at = NOW()
       `,
       [
@@ -961,16 +982,29 @@ async function replaceAccountsForItem(userId, itemId, institutionName, accounts)
   }
 }
 
-async function getAccountsForUser(userId, selectedItemIds = null) {
-  if (!selectedItemIds || selectedItemIds.length === 0) {
+async function getAccountsForUser(userId, selectedItemIds = null, selectedAccountIds = null) {
+  if (selectedAccountIds && selectedAccountIds.length > 0) {
     const result = await pool.query(
       `
       SELECT account_id, user_id, item_id, institution_name, name, official_name, mask, type, subtype
       FROM plaid_accounts
-      WHERE user_id = $1
+      WHERE user_id = $1 AND account_id = ANY($2::text[])
       ORDER BY institution_name ASC, name ASC
       `,
-      [userId]
+      [userId, selectedAccountIds]
+    );
+    return result.rows;
+  }
+
+  if (selectedItemIds && selectedItemIds.length > 0) {
+    const result = await pool.query(
+      `
+      SELECT account_id, user_id, item_id, institution_name, name, official_name, mask, type, subtype
+      FROM plaid_accounts
+      WHERE user_id = $1 AND item_id = ANY($2::text[])
+      ORDER BY institution_name ASC, name ASC
+      `,
+      [userId, selectedItemIds]
     );
     return result.rows;
   }
@@ -979,17 +1013,17 @@ async function getAccountsForUser(userId, selectedItemIds = null) {
     `
     SELECT account_id, user_id, item_id, institution_name, name, official_name, mask, type, subtype
     FROM plaid_accounts
-    WHERE user_id = $1 AND item_id = ANY($2::text[])
+    WHERE user_id = $1
     ORDER BY institution_name ASC, name ASC
     `,
-    [userId, selectedItemIds]
+    [userId]
   );
 
   return result.rows;
 }
 
 // =========================
-// Plaid helpers
+// Plaid transaction helpers
 // =========================
 async function getTransactionsForOneItem(itemRow, startDate, endDate) {
   const accessToken = itemRow.access_token;
@@ -1032,7 +1066,7 @@ async function getTransactionsForOneItem(itemRow, startDate, endDate) {
   return all;
 }
 
-async function getTransactionsForUser(userId, startDate, endDate, selectedItemIds = null) {
+async function getTransactionsForUser(userId, startDate, endDate, selectedItemIds = null, selectedAccountIds = null) {
   const items = await getUserItemsFiltered(userId, selectedItemIds);
   let allTransactions = [];
 
@@ -1041,12 +1075,18 @@ async function getTransactionsForUser(userId, startDate, endDate, selectedItemId
     allTransactions.push(...itemTx);
   }
 
+  if (selectedAccountIds && selectedAccountIds.length > 0) {
+    allTransactions = allTransactions.filter((tx) => selectedAccountIds.includes(tx.account_id));
+  }
+
   return allTransactions;
 }
 
-async function requireSelectedOrAllItems(req, res) {
+async function requireSelectionOrAll(req, res) {
   const userId = getUserId(req);
   const selectedItemIds = getSelectedItemIds(req);
+  const selectedAccountIds = getSelectedAccountIds(req);
+
   const items = await getUserItemsFiltered(userId, selectedItemIds);
 
   if (items.length === 0) {
@@ -1054,7 +1094,15 @@ async function requireSelectedOrAllItems(req, res) {
     return null;
   }
 
-  return { userId, selectedItemIds, items };
+  if (selectedAccountIds && selectedAccountIds.length > 0) {
+    const accounts = await getAccountsForUser(userId, selectedItemIds, selectedAccountIds);
+    if (accounts.length === 0) {
+      res.status(401).json({ error: "No selected accounts found." });
+      return null;
+    }
+  }
+
+  return { userId, selectedItemIds, selectedAccountIds, items };
 }
 
 // =========================
@@ -1088,9 +1136,7 @@ app.get("/connection_status", async (req, res) => {
     });
   } catch (err) {
     console.error("connection_status error:", err?.message || err);
-    res.status(500).json({
-      error: "Failed to get connection status.",
-    });
+    res.status(500).json({ error: "Failed to get connection status." });
   }
 });
 
@@ -1098,9 +1144,10 @@ app.get("/connected_accounts", async (req, res) => {
   try {
     const userId = getUserId(req);
     const selectedItemIds = getSelectedItemIds(req);
+    const selectedAccountIds = getSelectedAccountIds(req);
 
     const items = await getUserItemsFiltered(userId, selectedItemIds);
-    const accounts = await getAccountsForUser(userId, selectedItemIds);
+    const accounts = await getAccountsForUser(userId, selectedItemIds, selectedAccountIds);
 
     res.json({
       institutions: items.map((item) => ({
@@ -1109,6 +1156,8 @@ app.get("/connected_accounts", async (req, res) => {
         institution_name: item.institution_name,
       })),
       accounts,
+      selectedItemCount: selectedItemIds?.length || null,
+      selectedAccountCount: selectedAccountIds?.length || null,
     });
   } catch (err) {
     console.error("connected_accounts error:", err?.message || err);
@@ -1279,7 +1328,7 @@ app.post("/disconnect_bank", async (req, res) => {
         access_token: saved.access_token,
       });
     } catch {
-      // Ignore if item already invalid or sandbox oddity
+      // ignore
     }
 
     await deleteUserItem(userId, itemId);
@@ -1293,10 +1342,10 @@ app.post("/disconnect_bank", async (req, res) => {
 
 app.get("/alerts", async (req, res) => {
   try {
-    const ctx = await requireSelectedOrAllItems(req, res);
+    const ctx = await requireSelectionOrAll(req, res);
     if (!ctx) return;
 
-    const { userId, selectedItemIds } = ctx;
+    const { userId, selectedItemIds, selectedAccountIds } = ctx;
 
     const currentRange = getDateRangeLast30Days();
     const previousRange = getPrevious30DayRange();
@@ -1305,14 +1354,16 @@ app.get("/alerts", async (req, res) => {
       userId,
       currentRange.start,
       currentRange.end,
-      selectedItemIds
+      selectedItemIds,
+      selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
     const previousTransactions = (await getTransactionsForUser(
       userId,
       previousRange.start,
       previousRange.end,
-      selectedItemIds
+      selectedItemIds,
+      selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
     const totalSpent = currentTransactions.reduce((sum, tx) => sum + tx.amount, 0);
@@ -1325,6 +1376,7 @@ app.get("/alerts", async (req, res) => {
       previousSpent: Number(previousSpent.toFixed(2)),
       alerts,
       selectedItemCount: selectedItemIds?.length || null,
+      selectedAccountCount: selectedAccountIds?.length || null,
     });
   } catch (err) {
     console.error("alerts error:", err?.response?.data || err?.message || err);
@@ -1334,17 +1386,18 @@ app.get("/alerts", async (req, res) => {
 
 app.get("/insights", async (req, res) => {
   try {
-    const ctx = await requireSelectedOrAllItems(req, res);
+    const ctx = await requireSelectionOrAll(req, res);
     if (!ctx) return;
 
-    const { userId, selectedItemIds } = ctx;
+    const { userId, selectedItemIds, selectedAccountIds } = ctx;
     const range = getDateRangeLast30Days();
 
     const transactions = (await getTransactionsForUser(
       userId,
       range.start,
       range.end,
-      selectedItemIds
+      selectedItemIds,
+      selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
     const spentByCategoryRaw = sumByCategory(transactions);
@@ -1373,6 +1426,7 @@ app.get("/insights", async (req, res) => {
         remainingByCategory,
       },
       selectedItemCount: selectedItemIds?.length || null,
+      selectedAccountCount: selectedAccountIds?.length || null,
     });
   } catch (err) {
     console.error("insights error:", err?.response?.data || err?.message || err);
@@ -1382,10 +1436,10 @@ app.get("/insights", async (req, res) => {
 
 app.get("/transactions_by_month", async (req, res) => {
   try {
-    const ctx = await requireSelectedOrAllItems(req, res);
+    const ctx = await requireSelectionOrAll(req, res);
     if (!ctx) return;
 
-    const { userId, selectedItemIds } = ctx;
+    const { userId, selectedItemIds, selectedAccountIds } = ctx;
 
     const end = new Date();
     const start = new Date();
@@ -1398,7 +1452,8 @@ app.get("/transactions_by_month", async (req, res) => {
       userId,
       startDate,
       endDate,
-      selectedItemIds
+      selectedItemIds,
+      selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
     res.json(buildTransactionsByMonth(transactions, startDate, endDate));
@@ -1410,10 +1465,10 @@ app.get("/transactions_by_month", async (req, res) => {
 
 app.get("/money_insights", async (req, res) => {
   try {
-    const ctx = await requireSelectedOrAllItems(req, res);
+    const ctx = await requireSelectionOrAll(req, res);
     if (!ctx) return;
 
-    const { userId, selectedItemIds } = ctx;
+    const { userId, selectedItemIds, selectedAccountIds } = ctx;
 
     const currentRange = getDateRangeLast30Days();
     const previousRange = getPrevious30DayRange();
@@ -1423,21 +1478,24 @@ app.get("/money_insights", async (req, res) => {
       userId,
       currentRange.start,
       currentRange.end,
-      selectedItemIds
+      selectedItemIds,
+      selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
     const previousTransactions = (await getTransactionsForUser(
       userId,
       previousRange.start,
       previousRange.end,
-      selectedItemIds
+      selectedItemIds,
+      selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
     const sixMonthTransactions = (await getTransactionsForUser(
       userId,
       sixMonthRange.start,
       sixMonthRange.end,
-      selectedItemIds
+      selectedItemIds,
+      selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
     const insightData = buildMoneyInsights(
@@ -1449,6 +1507,7 @@ app.get("/money_insights", async (req, res) => {
     res.json({
       ...insightData,
       selectedItemCount: selectedItemIds?.length || null,
+      selectedAccountCount: selectedAccountIds?.length || null,
     });
   } catch (err) {
     console.error("money_insights error:", err?.response?.data || err?.message || err);
@@ -1458,22 +1517,24 @@ app.get("/money_insights", async (req, res) => {
 
 app.get("/category_chart", async (req, res) => {
   try {
-    const ctx = await requireSelectedOrAllItems(req, res);
+    const ctx = await requireSelectionOrAll(req, res);
     if (!ctx) return;
 
-    const { userId, selectedItemIds } = ctx;
+    const { userId, selectedItemIds, selectedAccountIds } = ctx;
     const range = getDateRangeLast30Days();
 
     const transactions = (await getTransactionsForUser(
       userId,
       range.start,
       range.end,
-      selectedItemIds
+      selectedItemIds,
+      selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
     res.json({
       categories: buildCategoryChartData(transactions),
       selectedItemCount: selectedItemIds?.length || null,
+      selectedAccountCount: selectedAccountIds?.length || null,
     });
   } catch (err) {
     console.error("category_chart error:", err?.response?.data || err?.message || err);
@@ -1483,10 +1544,10 @@ app.get("/category_chart", async (req, res) => {
 
 app.get("/weekly_summary", async (req, res) => {
   try {
-    const ctx = await requireSelectedOrAllItems(req, res);
+    const ctx = await requireSelectionOrAll(req, res);
     if (!ctx) return;
 
-    const { userId, selectedItemIds } = ctx;
+    const { userId, selectedItemIds, selectedAccountIds } = ctx;
 
     const currentWeekRange = getDateRangeLast7Days();
     const previousWeekRange = getPrevious7DayRange();
@@ -1495,14 +1556,16 @@ app.get("/weekly_summary", async (req, res) => {
       userId,
       currentWeekRange.start,
       currentWeekRange.end,
-      selectedItemIds
+      selectedItemIds,
+      selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
     const previousWeekTransactions = (await getTransactionsForUser(
       userId,
       previousWeekRange.start,
       previousWeekRange.end,
-      selectedItemIds
+      selectedItemIds,
+      selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
     const summary = buildWeeklySummary(currentWeekTransactions, previousWeekTransactions);
@@ -1510,6 +1573,7 @@ app.get("/weekly_summary", async (req, res) => {
     res.json({
       ...summary,
       selectedItemCount: selectedItemIds?.length || null,
+      selectedAccountCount: selectedAccountIds?.length || null,
     });
   } catch (err) {
     console.error("weekly_summary error:", err?.response?.data || err?.message || err);
@@ -1519,10 +1583,10 @@ app.get("/weekly_summary", async (req, res) => {
 
 app.get("/ai_recommendations", async (req, res) => {
   try {
-    const ctx = await requireSelectedOrAllItems(req, res);
+    const ctx = await requireSelectionOrAll(req, res);
     if (!ctx) return;
 
-    const { userId, selectedItemIds } = ctx;
+    const { userId, selectedItemIds, selectedAccountIds } = ctx;
 
     const currentRange = getDateRangeLast30Days();
     const previousRange = getPrevious30DayRange();
@@ -1532,21 +1596,24 @@ app.get("/ai_recommendations", async (req, res) => {
       userId,
       currentRange.start,
       currentRange.end,
-      selectedItemIds
+      selectedItemIds,
+      selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
     const previousTransactions = (await getTransactionsForUser(
       userId,
       previousRange.start,
       previousRange.end,
-      selectedItemIds
+      selectedItemIds,
+      selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
     const sixMonthTransactions = (await getTransactionsForUser(
       userId,
       sixMonthRange.start,
       sixMonthRange.end,
-      selectedItemIds
+      selectedItemIds,
+      selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
     const moneyInsights = buildMoneyInsights(
@@ -1563,6 +1630,7 @@ app.get("/ai_recommendations", async (req, res) => {
           message: item,
         })),
         selectedItemCount: selectedItemIds?.length || null,
+        selectedAccountCount: selectedAccountIds?.length || null,
       });
     }
 
@@ -1614,6 +1682,7 @@ ${JSON.stringify(moneyInsights, null, 2)}
         ? parsed.recommendations.slice(0, 3)
         : [],
       selectedItemCount: selectedItemIds?.length || null,
+      selectedAccountCount: selectedAccountIds?.length || null,
     });
   } catch (err) {
     console.error("ai_recommendations error:", err?.response?.data || err?.message || err);
@@ -1625,12 +1694,20 @@ app.post("/ask_budget_ai", async (req, res) => {
   try {
     const userId = getUserId(req);
     const selectedItemIds = getSelectedItemIds(req);
+    const selectedAccountIds = getSelectedAccountIds(req);
     const question = String(req.body?.question || "").trim();
 
     const items = await getUserItemsFiltered(userId, selectedItemIds);
 
     if (items.length === 0) {
       return res.status(401).json({ error: "No selected bank connected." });
+    }
+
+    if (selectedAccountIds && selectedAccountIds.length > 0) {
+      const accounts = await getAccountsForUser(userId, selectedItemIds, selectedAccountIds);
+      if (accounts.length === 0) {
+        return res.status(401).json({ error: "No selected accounts found." });
+      }
     }
 
     if (!question) {
@@ -1645,21 +1722,24 @@ app.post("/ask_budget_ai", async (req, res) => {
       userId,
       currentRange.start,
       currentRange.end,
-      selectedItemIds
+      selectedItemIds,
+      selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
     const previousTransactions = (await getTransactionsForUser(
       userId,
       previousRange.start,
       previousRange.end,
-      selectedItemIds
+      selectedItemIds,
+      selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
     const sixMonthTransactions = (await getTransactionsForUser(
       userId,
       sixMonthRange.start,
       sixMonthRange.end,
-      selectedItemIds
+      selectedItemIds,
+      selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
     const moneyInsights = buildMoneyInsights(
@@ -1677,6 +1757,7 @@ app.post("/ask_budget_ai", async (req, res) => {
       suggestions: result.suggestions,
       source: "rule_engine",
       selectedItemCount: selectedItemIds?.length || null,
+      selectedAccountCount: selectedAccountIds?.length || null,
     });
   } catch (err) {
     console.error("ask_budget_ai error:", err?.response?.data || err?.message || err);
