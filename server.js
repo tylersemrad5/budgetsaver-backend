@@ -1009,7 +1009,6 @@ async function replaceAccountsForItem(userId, itemId, institutionName, accounts)
       ]
     );
   }
-}
 
   for (const account of accounts) {
     await pool.query(
