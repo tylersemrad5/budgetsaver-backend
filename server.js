@@ -325,6 +325,17 @@ function sumByCategory(transactions) {
   return totals;
 }
 
+function topFlexibleCategories(categoryTotals, limit = 5) {
+  return Object.entries(categoryTotals)
+    .filter(([name]) => isFlexibleExpenseCategory(name.replace(/\s+/g, "_").toUpperCase()))
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([name, amount]) => ({
+      name,
+      amount: Number(amount.toFixed(2)),
+    }));
+}
+
 function sumByMerchant(transactions) {
   const totals = {};
   for (const tx of transactions) {
@@ -466,6 +477,29 @@ function findRecurringCharges(transactions) {
   return recurring.sort((a, b) => b.total - a.total).slice(0, 10);
 }
 
+function normalizeCategoryKey(raw) {
+  return String(raw || "").toUpperCase().trim();
+}
+
+function isFixedExpenseCategory(rawCategory) {
+  const category = normalizeCategoryKey(rawCategory);
+
+  return [
+    "LOAN_PAYMENTS",
+    "RENT_AND_UTILITIES",
+    "RENT",
+    "MORTGAGE",
+    "INSURANCE",
+    "TAXES",
+    "DEBT_PAYMENTS",
+    "TRANSFER_OUT"
+  ].includes(category);
+}
+
+function isFlexibleExpenseCategory(rawCategory) {
+  return !isFixedExpenseCategory(rawCategory);
+}
+
 // =========================
 // Insights engine
 // =========================
@@ -487,15 +521,17 @@ function buildBudgetScore(currentSpent, previousSpent, recurringCharges, topCate
   return Math.max(35, Math.min(100, score));
 }
 
-function buildSavingsOpportunities(topCategories, recurringCharges) {
+function buildSavingsOpportunities(topCategories, recurringCharges, flexibleCategories = []) {
   const opportunities = [];
 
-  if (topCategories[0]) {
+  const topFlexible = flexibleCategories[0];
+
+  if (topFlexible) {
     opportunities.push({
-      title: `Reduce ${topCategories[0].name}`,
-      amount: Number((topCategories[0].amount * 0.15).toFixed(2)),
-      message: `Cutting 15% from ${topCategories[0].name} could save about $${(
-        topCategories[0].amount * 0.15
+      title: `Reduce ${topFlexible.name}`,
+      amount: Number((topFlexible.amount * 0.15).toFixed(2)),
+      message: `Cutting 15% from ${topFlexible.name} could save about $${(
+        topFlexible.amount * 0.15
       ).toFixed(2)}.`,
     });
   }
@@ -510,18 +546,28 @@ function buildSavingsOpportunities(topCategories, recurringCharges) {
     });
   }
 
+  if (opportunities.length === 0 && topCategories[0]) {
+    opportunities.push({
+      title: `Review overall spending`,
+      amount: 0,
+      message: `${topCategories[0].name} is one of your largest expenses, but it may be a fixed obligation. Focus on flexible categories and recurring charges first.`,
+    });
+  }
+
   return opportunities.slice(0, 3);
 }
 
-function buildActionItems(currentSpent, previousSpent, topCategories, recurringCharges) {
+function buildActionItems(currentSpent, previousSpent, topCategories, recurringCharges, flexibleCategories = []) {
   const items = [];
 
   if (currentSpent > previousSpent) {
-    items.push("Your spending is up from the previous period. Review your largest category first.");
+    items.push("Your spending is up from the previous period. Review your largest flexible category first.");
   }
 
-  if (topCategories[0]) {
-    items.push(`Your biggest category is ${topCategories[0].name}. That is the fastest place to cut.`);
+  if (flexibleCategories[0]) {
+    items.push(`Your biggest flexible category is ${flexibleCategories[0].name}. That is the fastest place to cut.`);
+  } else if (topCategories[0]) {
+    items.push(`Your largest category is ${topCategories[0].name}, but it may be a fixed expense. Focus on flexible spending first.`);
   }
 
   if (recurringCharges.length > 0) {
@@ -529,7 +575,7 @@ function buildActionItems(currentSpent, previousSpent, topCategories, recurringC
   }
 
   if (items.length === 0) {
-    items.push("Your spending is stable. Keep tracking your top categories to stay on target.");
+    items.push("Your spending is stable. Keep tracking your flexible categories to stay on target.");
   }
 
   return items.slice(0, 4);
@@ -563,14 +609,25 @@ function buildActionableMessages(currentTransactions, previousTransactions) {
   const messages = [];
 
   const topCategory = topEntries(currentCategories, 1)[0];
-  if (topCategory) {
-    messages.push({
-      title: `${topCategory.name} is your biggest category`,
-      message: `You spent $${topCategory.amount.toFixed(2)} on ${topCategory.name}. This is the fastest category to target if you want quick savings.`,
-      impact: "high",
-      suggestedAction: `Try cutting ${topCategory.name} by 10–15% this month.`,
-    });
-  }
+const topFlexibleCategory = topFlexibleCategories(currentCategories, 1)[0];
+
+if (topCategory) {
+  const normalizedTopCategory = String(topCategory.name).replace(/\s+/g, "_").toUpperCase();
+  const isFixed = isFixedExpenseCategory(normalizedTopCategory);
+
+  messages.push({
+    title: `${topCategory.name} is your biggest category`,
+    message: isFixed
+      ? `You spent $${topCategory.amount.toFixed(2)} on ${topCategory.name}. This appears to be a fixed obligation, so look for savings in flexible categories instead.`
+      : `You spent $${topCategory.amount.toFixed(2)} on ${topCategory.name}. This is the fastest category to target if you want quick savings.`,
+    impact: "high",
+    suggestedAction: isFixed
+      ? topFlexibleCategory
+        ? `Focus on reducing ${topFlexibleCategory.name} instead of fixed payments.`
+        : `Review flexible spending and recurring charges instead of fixed payments.`
+      : `Try cutting ${topCategory.name} by 10–15% this month.`,
+  });
+}
 
   const topMerchant = topEntries(currentMerchants, 1)[0];
   if (topMerchant) {
@@ -703,6 +760,7 @@ function buildMoneyInsights(currentTransactions, previousTransactions, sixMonthT
   const recurringCharges = findRecurringCharges(currentTransactions);
   const insights = buildRuleInsights(currentTransactions, previousTransactions);
   const topCategories = topEntries(categoryTotals, 5);
+  const flexibleCategories = topFlexibleCategories(categoryTotals, 5);
   const topMerchants = topEntries(merchantTotals, 5);
 
   const topCategoryAmount = topCategories[0]?.amount || 0;
@@ -726,12 +784,13 @@ function buildMoneyInsights(currentTransactions, previousTransactions, sixMonthT
     recurringCharges,
     insights,
     actionableMessages: buildActionableMessages(currentTransactions, previousTransactions),
-    savingsOpportunities: buildSavingsOpportunities(topCategories, recurringCharges),
+    savingsOpportunities: buildSavingsOpportunities(topCategories, recurringCharges, flexibleCategories),
     actionItems: buildActionItems(
       currentSpent,
       previousSpent,
       topCategories,
-      recurringCharges
+      recurringCharges,
+      flexibleCategories
     ),
     riskFlags: buildRiskFlags(
       currentSpent,
@@ -874,12 +933,24 @@ function buildBudgetAIResponse(question, moneyInsights) {
       "How much could I save this month?"
     ];
   } else if (q.includes("save") || q.includes("saving")) {
-    if (moneyInsights.savingsOpportunities.length > 0) {
-      const topOpportunity = moneyInsights.savingsOpportunities[0];
-      answer = `Your best near-term savings move is **${topOpportunity.title}**. ${topOpportunity.message}`;
-    } else {
-      answer = "I don't have a strong savings recommendation yet. Keep tracking your top categories.";
-    }
+  const topCategory = moneyInsights.topCategories[0];
+  const normalizedTopCategory = topCategory
+    ? String(topCategory.name).replace(/\s+/g, "_").toUpperCase()
+    : "";
+
+  const topCategoryIsFixed = topCategory
+    ? isFixedExpenseCategory(normalizedTopCategory)
+    : false;
+
+  if (moneyInsights.savingsOpportunities.length > 0) {
+    const topOpportunity = moneyInsights.savingsOpportunities[0];
+
+    answer = topCategoryIsFixed
+      ? `Your largest expense looks like a fixed obligation (**${topCategory.name}**), so the best near-term savings move is **${topOpportunity.title}**. ${topOpportunity.message}`
+      : `Your best near-term savings move is **${topOpportunity.title}**. ${topOpportunity.message}`;
+  } else {
+    answer = "I don't have a strong savings recommendation yet. Focus on flexible spending and recurring charges first.";
+  }
 
     suggestions = [
       "What category is hurting me most?",
