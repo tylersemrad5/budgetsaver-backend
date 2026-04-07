@@ -1,4 +1,5 @@
 import express from "express";
+import rateLimit from "express-rate-limit"
 import cors from "cors";
 import dotenv from "dotenv";
 import plaid from "plaid";
@@ -13,6 +14,30 @@ const { Pool } = pg;
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+const generalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Please try again in a minute." },
+});
+
+const plaidLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 40,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many Plaid requests. Please slow down and try again." },
+});
+
+const aiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many AI requests. Please wait a moment and try again." },
+});
 
 const PORT = process.env.PORT || 3000;
 
@@ -1921,6 +1946,27 @@ app.get("/spending_by_account", async (req, res) => {
     res.status(500).json({ error: "Failed to build spending by account." });
   }
 });
+
+app.use("/", generalLimiter);
+app.use("/health", generalLimiter);
+app.use("/connection_status", generalLimiter);
+app.use("/connected_accounts", generalLimiter);
+app.use("/alerts", generalLimiter);
+app.use("/insights", generalLimiter);
+app.use("/transactions_by_month", generalLimiter);
+app.use("/money_insights", generalLimiter);
+app.use("/category_chart", generalLimiter);
+app.use("/weekly_summary", generalLimiter);
+app.use("/spending_by_account", generalLimiter);
+
+app.use("/create_link_token", plaidLimiter);
+app.use("/exchange_public_token", plaidLimiter);
+app.use("/sync_connected_accounts", plaidLimiter);
+app.use("/disconnect_bank", plaidLimiter);
+app.use("/plaid/webhook", plaidLimiter);
+
+app.use("/ai_recommendations", aiLimiter);
+app.use("/ask_budget_ai", aiLimiter);
 
 // =========================
 // Start server
