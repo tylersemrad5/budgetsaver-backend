@@ -2296,6 +2296,39 @@ app.get("/spending_by_account", async (req, res) => {
   }
 });
 
+app.get("/debug_transaction_count", async (req, res) => {
+  try {
+    const userId = getUserId(req);
+
+    const txCountResult = await pool.query(
+      `
+      SELECT COUNT(*)::int AS count
+      FROM plaid_transactions
+      WHERE user_id = $1
+      `,
+      [userId]
+    );
+
+    const itemCountResult = await pool.query(
+      `
+      SELECT COUNT(*)::int AS count
+      FROM plaid_items
+      WHERE user_id = $1
+      `,
+      [userId]
+    );
+
+    res.json({
+      userId,
+      itemCount: itemCountResult.rows[0].count,
+      transactionCount: txCountResult.rows[0].count,
+    });
+  } catch (err) {
+    console.error("debug_transaction_count error:", err?.message || err);
+    res.status(500).json({ error: "Failed to debug transaction count." });
+  }
+});
+
 // =========================
 // Start server
 // =========================
