@@ -1665,27 +1665,76 @@ app.post("/sync_transactions", async (req, res) => {
     const results = [];
 
     for (const item of items) {
-  const syncState = await getItemSyncState(item.item_id);
+      const syncState = await getItemSyncState(item.item_id);
 
-  let result;
+      if (!syncState || !syncState.transactions_cursor) {
+        console.log(`Running initial full sync for item ${item.item_id}`);
 
-  if (!syncState) {
-    // FIRST TIME → FULL LOAD
-    console.log("🚀 Running initial full sync...");
-    const count = await initialFullTransactionSync(item);
+        const end = new Date();
+        const start = new Date();
+        start.setMonth(end.getMonth() - 6);
 
-    result = {
-      item_id: item.item_id,
-      initial_sync: true,
-      added: count,
-    };
-  } else {
-    // NORMAL SYNC
-    result = await syncTransactionsForItem(item);
+        const startDate = start.toISOString().slice(0, 10);
+        const endDate = end.toISOString().slice(0, 10);
+
+        const transactions = await getTransactionsForOneItem(
+          item,
+          startDate,
+          endDate
+        );
+
+        await applyTransactionSyncUpdates(userId, item.item_id, {
+          added: transactions,
+          modified: [],
+          removed: [],
+        });
+
+        await upsertItemSyncState(userId, item.item_id, "initial_full_sync_complete");
+
+        results.push({
+          item_id: item.item_id,
+          initial_sync: true,
+          added: transactions.length,
+          modified: 0,
+          removed: 0,
+        });
+      } else {
+        const synced = await syncTransactionsForItem(item);
+
+        results.push({
+          item_id: synced.item_id,
+          initial_sync: false,
+          added: synced.added,
+          modified: synced.modified,
+          removed: synced.removed,
+          next_cursor: synced.next_cursor,
+        });
+      }
+    }
+
+    const countResult = await pool.query(
+      `
+      SELECT COUNT(*)::int AS count
+      FROM plaid_transactions
+      WHERE user_id = $1
+      `,
+      [userId]
+    );
+
+    res.json({
+      ok: true,
+      syncedItems: results.length,
+      storedTransactionCount: countResult.rows[0].count,
+      results,
+    });
+  } catch (err) {
+    console.error("sync_transactions error:", err?.response?.data || err?.message || err);
+    res.status(500).json({
+      error: "Failed to sync transactions.",
+      details: err?.response?.data || err?.message || "Unknown error",
+    });
   }
-
-  results.push(result);
-}
+});
 
 app.post("/exchange_public_token", async (req, res) => {
   try {
