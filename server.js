@@ -1077,6 +1077,7 @@ async function replaceAccountsForItem(userId, itemId, institutionName, accounts)
       ]
     );
   }
+}
 
   for (const account of accounts) {
     await pool.query(
@@ -1396,6 +1397,29 @@ async function requireSelectionOrAll(req, res) {
   }
 
   
+async function requireSelectionOrAll(req, res) {
+  const userId = getUserId(req);
+  const selectedItemIds = getSelectedItemIds(req);
+  const selectedAccountIds = getSelectedAccountIds(req);
+
+  const items = await getUserItemsFiltered(userId, selectedItemIds);
+
+  if (items.length === 0) {
+    res.status(401).json({ error: "No selected bank connected." });
+    return null;
+  }
+
+  if (selectedAccountIds && selectedAccountIds.length > 0) {
+    const accounts = await getAccountsForUser(userId, selectedItemIds, selectedAccountIds);
+    if (accounts.length === 0) {
+      res.status(401).json({ error: "No selected accounts found." });
+      return null;
+    }
+  }
+
+  return { userId, selectedItemIds, selectedAccountIds, items };
+}
+
 async function syncTransactionsForItem(itemRow, webhookCode = null) {
   const userId = itemRow.user_id;
   const itemId = itemRow.item_id;
@@ -1467,6 +1491,27 @@ async function syncTransactionsForItem(itemRow, webhookCode = null) {
     next_cursor: nextCursor,
   };
 }
+
+app.use("/", generalLimiter);
+app.use("/health", generalLimiter);
+app.use("/connection_status", generalLimiter);
+app.use("/connected_accounts", generalLimiter);
+app.use("/alerts", generalLimiter);
+app.use("/insights", generalLimiter);
+app.use("/transactions_by_month", generalLimiter);
+app.use("/money_insights", generalLimiter);
+app.use("/category_chart", generalLimiter);
+app.use("/weekly_summary", generalLimiter);
+app.use("/spending_by_account", generalLimiter);
+
+app.use("/create_link_token", plaidLimiter);
+app.use("/exchange_public_token", plaidLimiter);
+app.use("/sync_connected_accounts", plaidLimiter);
+app.use("/disconnect_bank", plaidLimiter);
+app.use("/plaid/webhook", plaidLimiter);
+
+app.use("/ai_recommendations", aiLimiter);
+app.use("/ask_budget_ai", aiLimiter);
   
 // =========================
 // Routes
@@ -2276,29 +2321,6 @@ app.get("/spending_by_account", async (req, res) => {
     res.status(500).json({ error: "Failed to build spending by account." });
   }
 });
-
-app.use("/", generalLimiter);
-app.use("/health", generalLimiter);
-app.use("/connection_status", generalLimiter);
-app.use("/connected_accounts", generalLimiter);
-app.use("/alerts", generalLimiter);
-app.use("/insights", generalLimiter);
-app.use("/transactions_by_month", generalLimiter);
-app.use("/money_insights", generalLimiter);
-app.use("/category_chart", generalLimiter);
-app.use("/weekly_summary", generalLimiter);
-app.use("/spending_by_account", generalLimiter);
-
-app.use("/create_link_token", plaidLimiter);
-app.use("/exchange_public_token", plaidLimiter);
-app.use("/sync_connected_accounts", plaidLimiter);
-app.use("/disconnect_bank", plaidLimiter);
-app.use("/plaid/webhook", plaidLimiter);
-
-app.use("/ai_recommendations", aiLimiter);
-app.use("/ask_budget_ai", aiLimiter);
-
-
 
 // =========================
 // Start server
