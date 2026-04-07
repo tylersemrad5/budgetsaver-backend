@@ -116,7 +116,7 @@ await pool.query(`
   ADD COLUMN IF NOT EXISTS available_balance DOUBLE PRECISION;
 `);
 
-    await pool.query(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS plaid_item_sync_state (
       item_id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -1110,7 +1110,6 @@ async function replaceAccountsForItem(userId, itemId, institutionName, accounts)
     );
   }
 }
-
 async function getItemSyncState(itemId) {
   const result = await pool.query(
     `
@@ -1248,79 +1247,6 @@ async function applyTransactionSyncUpdates(userId, itemId, syncData) {
   } finally {
     client.release();
   }
-}
-
-async function getAccountsForUser(userId, selectedItemIds = null, selectedAccountIds = null) {
-  if (selectedAccountIds && selectedAccountIds.length > 0) {
-    const result = await pool.query(
-      `
-      SELECT
-        account_id,
-        user_id,
-        item_id,
-        institution_name,
-        name,
-        official_name,
-        mask,
-        type,
-        subtype,
-        current_balance,
-        available_balance
-      FROM plaid_accounts
-      WHERE user_id = $1 AND account_id = ANY($2::text[])
-      ORDER BY institution_name ASC, name ASC
-      `,
-      [userId, selectedAccountIds]
-    );
-    return result.rows;
-  }
-
-  if (selectedItemIds && selectedItemIds.length > 0) {
-    const result = await pool.query(
-      `
-      SELECT
-        account_id,
-        user_id,
-        item_id,
-        institution_name,
-        name,
-        official_name,
-        mask,
-        type,
-        subtype,
-        current_balance,
-        available_balance
-      FROM plaid_accounts
-      WHERE user_id = $1 AND item_id = ANY($2::text[])
-      ORDER BY institution_name ASC, name ASC
-      `,
-      [userId, selectedItemIds]
-    );
-    return result.rows;
-  }
-
-  const result = await pool.query(
-    `
-    SELECT
-      account_id,
-      user_id,
-      item_id,
-      institution_name,
-      name,
-      official_name,
-      mask,
-      type,
-      subtype,
-      current_balance,
-      available_balance
-    FROM plaid_accounts
-    WHERE user_id = $1
-    ORDER BY institution_name ASC, name ASC
-    `,
-    [userId]
-  );
-
-  return result.rows;
 }
 
 async function getStoredTransactionsForUser(
@@ -1516,13 +1442,14 @@ async function syncTransactionsForItem(itemRow, webhookCode = null) {
         message: err?.message,
       });
 
-      // Plaid recommends restarting the entire pagination loop if a mutation-during-pagination
-      // error happens while paging through /transactions/sync updates.
       if (errorCode === "TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION") {
-        return await syncTransactionsForItem(
-          { ...itemRow, _restartCursor: originalCursor },
-          webhookCode
-        );
+        cursor = originalCursor;
+        nextCursor = originalCursor;
+        hasMore = true;
+        accumulated.added = [];
+        accumulated.modified = [];
+        accumulated.removed = [];
+        continue;
       }
 
       throw err;
@@ -1540,9 +1467,7 @@ async function syncTransactionsForItem(itemRow, webhookCode = null) {
     next_cursor: nextCursor,
   };
 }
-  return { userId, selectedItemIds, selectedAccountIds, items };
-}
-
+  
 // =========================
 // Routes
 // =========================
@@ -1766,6 +1691,15 @@ app.post("/exchange_public_token", async (req, res) => {
       console.error("accountsGet warning:", err?.response?.data || err?.message || err);
     }
 
+      try {
+      const linkedItem = await getUserItemByItemId(userId, itemId);
+      if (linkedItem) {
+        await syncTransactionsForItem(linkedItem);
+      }
+    } catch (err) {
+      console.error("initial transaction sync warning:", err?.response?.data || err?.message || err);
+    }
+
     res.json({
       ok: true,
       item_id: itemId,
@@ -1922,7 +1856,7 @@ app.get("/transactions_by_month", async (req, res) => {
     const startDate = formatDate(start);
     const endDate = formatDate(end);
 
-    const transactions = (await getTransactionsForUser(
+    const transactions = (await getStoredTransactionsForUser(
       userId,
       startDate,
       endDate,
