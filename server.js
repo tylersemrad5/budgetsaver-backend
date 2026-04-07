@@ -1992,7 +1992,7 @@ app.get("/transactions_by_month", async (req, res) => {
     )).filter(isDebitLikeTransaction);
 
     res.json(buildTransactionsByMonth(transactions, startDate, endDate));
-  } } catch (err) {
+  } catch (err) {
   console.error("transactions_by_month error full:", err);
   console.error("transactions_by_month error message:", err?.message || err);
   console.error("transactions_by_month error stack:", err?.stack || "no stack");
