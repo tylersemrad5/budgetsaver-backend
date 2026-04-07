@@ -509,6 +509,232 @@ function isFlexibleExpenseCategory(rawCategory) {
 // =========================
 // Insights engine
 // =========================
+function recurringFrequencyLabel(count, firstDate, lastDate) {
+  if (!firstDate || !lastDate || count < 2) return "Recurring";
+
+  const first = new Date(firstDate);
+  const last = new Date(lastDate);
+  const diffMs = Math.abs(last - first);
+  const diffDays = Math.max(1, Math.round(diffMs / (1000 * 60 * 60 * 24)));
+  const averageGap = diffDays / Math.max(1, count - 1);
+
+  if (averageGap <= 10) return "Weekly";
+  if (averageGap <= 20) return "Biweekly";
+  if (averageGap <= 40) return "Monthly";
+  if (averageGap <= 75) return "Every 2 months";
+  return "Recurring";
+}
+
+function nextExpectedChargeDate(lastDate, frequencyLabel) {
+  if (!lastDate) return null;
+
+  const d = new Date(lastDate);
+
+  switch (frequencyLabel) {
+    case "Weekly":
+      d.setDate(d.getDate() + 7);
+      break;
+    case "Biweekly":
+      d.setDate(d.getDate() + 14);
+      break;
+    case "Monthly":
+      d.setMonth(d.getMonth() + 1);
+      break;
+    case "Every 2 months":
+      d.setMonth(d.getMonth() + 2);
+      break;
+    default:
+      d.setMonth(d.getMonth() + 1);
+      break;
+  }
+
+  return d.toISOString().slice(0, 10);
+}
+
+function isSubscriptionLikeCategory(rawCategory) {
+  const category = normalizeCategoryKey(rawCategory);
+
+  return [
+    "ENTERTAINMENT",
+    "GENERAL_SERVICES",
+    "PERSONAL_CARE",
+    "GENERAL_MERCHANDISE",
+    "FOOD_AND_DRINK",
+    "TRANSPORTATION",
+    "TELECOMMUNICATIONS",
+    "STREAMING",
+    "SUBSCRIPTIONS",
+  ].includes(category);
+}
+
+function buildSubscriptionInsights(transactions) {
+  const merchantGroups = {};
+
+  for (const tx of transactions) {
+    const merchant = normalizeMerchant(tx);
+    if (!merchant || merchant.toLowerCase() === "unknown") continue;
+    if (tx.pending) continue;
+    if (typeof tx.amount !== "number" || tx.amount <= 0) continue;
+
+    const normalizedCategory = normalizeCategoryKey(getCategory(tx));
+    if (!isSubscriptionLikeCategory(normalizedCategory)) continue;
+
+    if (!merchantGroups[merchant]) {
+      merchantGroups[merchant] = [];
+    }
+
+    merchantGroups[merchant].push(tx);
+  }
+
+  const subscriptions = [];
+
+  for (const [merchant, txs] of Object.entries(merchantGroups)) {
+    if (txs.length < 2) continue;
+
+    const sorted = [...txs].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    const firstDate = sorted[0]?.date || null;
+    const lastDate = sorted[sorted.length - 1]?.date || null;
+    const count = sorted.length;
+    const total = sorted.reduce((sum, tx) => sum + tx.amount, 0);
+    const average = total / count;
+    const frequency = recurringFrequencyLabel(count, firstDate, lastDate);
+
+    const amountVarianceOk = sorted.every((tx) => Math.abs(tx.amount - average) <= Math.max(5, average * 0.35));
+
+    if (!amountVarianceOk) continue;
+
+    subscriptions.push({
+      merchant,
+      count,
+      total: Number(total.toFixed(2)),
+      average: Number(average.toFixed(2)),
+      frequency,
+      firstDate,
+      lastDate,
+      nextExpectedDate: nextExpectedChargeDate(lastDate, frequency),
+      category: formatCategoryName(getCategory(sorted[sorted.length - 1])),
+    });
+  }
+
+  const filtered = subscriptions
+    .filter((s) => s.frequency === "Monthly" || s.frequency === "Biweekly" || s.frequency === "Weekly")
+    .sort((a, b) => b.average - a.average);
+
+  const estimatedMonthlyTotal = filtered.reduce((sum, sub) => {
+    if (sub.frequency === "Weekly") return sum + sub.average * 4;
+    if (sub.frequency === "Biweekly") return sum + sub.average * 2;
+    return sum + sub.average;
+  }, 0);
+
+  return {
+    subscriptions: filtered.slice(0, 12),
+    totalMonthlySubscriptionSpend: Number(estimatedMonthlyTotal.toFixed(2)),
+  };
+}
+
+function buildFixedVsFlexible(categoryTotals) {
+  let fixed = 0;
+  let flexible = 0;
+
+  for (const [categoryName, amount] of Object.entries(categoryTotals)) {
+    const normalized = String(categoryName).replace(/\s+/g, "_").toUpperCase();
+
+    if (isFixedExpenseCategory(normalized)) {
+      fixed += amount;
+    } else {
+      flexible += amount;
+    }
+  }
+
+  const total = fixed + flexible;
+
+  return {
+    fixed: Number(fixed.toFixed(2)),
+    flexible: Number(flexible.toFixed(2)),
+    fixedPercent: total > 0 ? Number(((fixed / total) * 100).toFixed(1)) : 0,
+    flexiblePercent: total > 0 ? Number(((flexible / total) * 100).toFixed(1)) : 0,
+  };
+}
+
+function isEssentialCategory(rawCategory) {
+  const category = normalizeCategoryKey(rawCategory);
+
+  return [
+    "FOOD_AND_DRINK",
+    "TRANSPORTATION",
+    "LOAN_PAYMENTS",
+    "RENT_AND_UTILITIES",
+    "RENT",
+    "MORTGAGE",
+    "INSURANCE",
+    "HEALTHCARE",
+    "PERSONAL_CARE",
+    "GENERAL_SERVICES",
+    "TAXES",
+    "DEBT_PAYMENTS",
+  ].includes(category);
+}
+
+function buildEssentialVsNonEssential(categoryTotals) {
+  let essential = 0;
+  let nonEssential = 0;
+
+  for (const [categoryName, amount] of Object.entries(categoryTotals)) {
+    const normalized = String(categoryName).replace(/\s+/g, "_").toUpperCase();
+
+    if (isEssentialCategory(normalized)) {
+      essential += amount;
+    } else {
+      nonEssential += amount;
+    }
+  }
+
+  const total = essential + nonEssential;
+
+  return {
+    essential: Number(essential.toFixed(2)),
+    nonEssential: Number(nonEssential.toFixed(2)),
+    essentialPercent: total > 0 ? Number(((essential / total) * 100).toFixed(1)) : 0,
+    nonEssentialPercent: total > 0 ? Number(((nonEssential / total) * 100).toFixed(1)) : 0,
+  };
+}
+
+function buildSmartSavingsTips(topFlexibleCategories, subscriptionInsights) {
+  const tips = [];
+
+  if (topFlexibleCategories[0]) {
+    const amount = topFlexibleCategories[0].amount * 0.1;
+    tips.push({
+      title: `Trim ${topFlexibleCategories[0].name}`,
+      message: `Cutting 10% from ${topFlexibleCategories[0].name} could save about $${amount.toFixed(2)}.`,
+      estimatedSavings: Number(amount.toFixed(2)),
+    });
+  }
+
+  if (subscriptionInsights.subscriptions[0]) {
+    const sub = subscriptionInsights.subscriptions[0];
+    tips.push({
+      title: `Review ${sub.merchant}`,
+      message: `${sub.merchant} looks like a ${sub.frequency.toLowerCase()} recurring charge averaging $${sub.average.toFixed(2)}.`,
+      estimatedSavings: sub.frequency === "Weekly"
+        ? Number((sub.average * 4).toFixed(2))
+        : sub.frequency === "Biweekly"
+        ? Number((sub.average * 2).toFixed(2))
+        : Number(sub.average.toFixed(2)),
+    });
+  }
+
+  if (subscriptionInsights.totalMonthlySubscriptionSpend > 0) {
+    tips.push({
+      title: "Lower subscription load",
+      message: `Your estimated monthly subscription spend is $${subscriptionInsights.totalMonthlySubscriptionSpend.toFixed(2)}.`,
+      estimatedSavings: Number((subscriptionInsights.totalMonthlySubscriptionSpend * 0.25).toFixed(2)),
+    });
+  }
+
+  return tips.slice(0, 4);
+}
+
 function buildBudgetScore(currentSpent, previousSpent, recurringCharges, topCategoryAmount) {
   let score = 100;
 
@@ -777,6 +1003,11 @@ function buildMoneyInsights(currentTransactions, previousTransactions, sixMonthT
     topCategoryAmount
   );
 
+  const subscriptionInsights = buildSubscriptionInsights(currentTransactions);
+  const fixedVsFlexible = buildFixedVsFlexible(categoryTotals);
+  const essentialVsNonEssential = buildEssentialVsNonEssential(categoryTotals);
+  const smartSavingsTips = buildSmartSavingsTips(flexibleCategories, subscriptionInsights);
+
   return {
     summary: {
       currentSpent: Number(currentSpent.toFixed(2)),
@@ -806,6 +1037,10 @@ function buildMoneyInsights(currentTransactions, previousTransactions, sixMonthT
     ),
     monthlyTrend: buildMonthlyTrend(sixMonthTransactions),
     categoryChart: buildCategoryChartData(currentTransactions),
+    fixedVsFlexible,
+    essentialVsNonEssential,
+    subscriptionInsights,
+    smartSavingsTips,
   };
 }
 
