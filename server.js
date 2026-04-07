@@ -384,16 +384,15 @@ function buildTransactionsByMonth(transactions, start, end) {
   const groups = {};
 
   for (const tx of transactions) {
-    const normalizedDate = safeDateString(tx.date);
-    if (!normalizedDate) continue;
+    if (!tx.date) continue;
 
-    const key = monthKeyFromDateString(normalizedDate);
+    const key = monthKeyFromDateString(tx.date);
     if (!groups[key]) groups[key] = [];
 
     groups[key].push({
       id: tx.transaction_id,
       name: tx.name || "Unknown",
-      date: normalizedDate,
+      date: tx.date,
       amount: Number((tx.amount ?? 0).toFixed(2)),
       category: formatCategoryName(getCategory(tx)),
       institutionName: tx._institution_name || null,
@@ -401,6 +400,8 @@ function buildTransactionsByMonth(transactions, start, end) {
       accountMask: tx._account_mask || null,
       item_id: tx._item_id || null,
       account_id: tx.account_id || null,
+      pending: !!tx.pending,
+      status: tx.pending ? "pending" : "posted",
     });
   }
 
@@ -409,7 +410,12 @@ function buildTransactionsByMonth(transactions, start, end) {
       month,
       totalSpent: Number(txs.reduce((sum, t) => sum + t.amount, 0).toFixed(2)),
       count: txs.length,
-      transactions: txs.sort((a, b) => b.date.localeCompare(a.date)),
+      pendingCount: txs.filter((t) => t.pending).length,
+      postedCount: txs.filter((t) => !t.pending).length,
+      transactions: txs.sort((a, b) => {
+        if (b.date !== a.date) return b.date.localeCompare(a.date);
+        return Number(a.pending) - Number(b.pending);
+      }),
     }))
     .sort((a, b) => b.month.localeCompare(a.month));
 
@@ -1438,7 +1444,7 @@ async function getStoredTransactionsForUser(
     idx += 1;
   }
 
-  query += ` ORDER BY t.date DESC`;
+  query += ` ORDER BY t.date DESC, t.updated_at DESC`;
 
   const result = await pool.query(query, params);
 
@@ -1446,11 +1452,14 @@ async function getStoredTransactionsForUser(
     transaction_id: row.transaction_id,
     account_id: row.account_id,
     _item_id: row._item_id,
-    date: row.date,
+    date:
+      row.date instanceof Date
+        ? row.date.toISOString().slice(0, 10)
+        : String(row.date).slice(0, 10),
     name: row.name,
     merchant_name: row.merchant_name,
     amount: row.amount,
-    pending: row.pending,
+    pending: !!row.pending,
     personal_finance_category: row.category_primary
       ? { primary: row.category_primary }
       : null,
@@ -1758,74 +1767,34 @@ app.post("/sync_transactions", async (req, res) => {
     const results = [];
 
     for (const item of items) {
-      const syncState = await getItemSyncState(item.item_id);
-
-      if (!syncState || !syncState.transactions_cursor) {
-        console.log(`Running initial full sync for item ${item.item_id}`);
-
-        const end = new Date();
-        const start = new Date();
-        start.setMonth(end.getMonth() - 6);
-
-        const startDate = start.toISOString().slice(0, 10);
-        const endDate = end.toISOString().slice(0, 10);
-
-        const transactions = await getTransactionsForOneItem(
-          item,
-          startDate,
-          endDate
-        );
-
-        await applyTransactionSyncUpdates(userId, item.item_id, {
-          added: transactions,
-          modified: [],
-          removed: [],
-        });
-
-        await upsertItemSyncState(userId, item.item_id, "initial_full_sync_complete");
-
+      try {
+        const synced = await syncTransactionsForItem(item);
         results.push({
           item_id: item.item_id,
-          initial_sync: true,
-          added: transactions.length,
-          modified: 0,
-          removed: 0,
+          ok: true,
+          ...synced,
         });
-      } else {
-        const synced = await syncTransactionsForItem(item);
-
+      } catch (err) {
+        console.error("sync_transactions item error:", item.item_id, err?.response?.data || err?.message || err);
         results.push({
-          item_id: synced.item_id,
-          initial_sync: false,
-          added: synced.added,
-          modified: synced.modified,
-          removed: synced.removed,
-          next_cursor: synced.next_cursor,
+          item_id: item.item_id,
+          ok: false,
+          error: err?.response?.data?.error_message || err?.message || "Unknown sync error",
         });
       }
     }
 
-    const countResult = await pool.query(
-      `
-      SELECT COUNT(*)::int AS count
-      FROM plaid_transactions
-      WHERE user_id = $1
-      `,
-      [userId]
-    );
+    const okCount = results.filter((r) => r.ok).length;
 
     res.json({
-      ok: true,
-      syncedItems: results.length,
-      storedTransactionCount: countResult.rows[0].count,
+      ok: okCount > 0,
+      syncedItems: okCount,
       results,
+      syncedAt: new Date().toISOString(),
     });
   } catch (err) {
     console.error("sync_transactions error:", err?.response?.data || err?.message || err);
-    res.status(500).json({
-      error: "Failed to sync transactions.",
-      details: err?.response?.data || err?.message || "Unknown error",
-    });
+    res.status(500).json({ error: "Failed to sync transactions." });
   }
 });
 
