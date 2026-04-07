@@ -1465,6 +1465,34 @@ async function requireSelectionOrAll(req, res) {
   return { userId, selectedItemIds, selectedAccountIds, items };
 }
 
+async function initialFullTransactionSync(itemRow) {
+  const userId = itemRow.user_id;
+  const itemId = itemRow.item_id;
+
+  const end = new Date();
+  const start = new Date();
+  start.setMonth(end.getMonth() - 6); // last 6 months
+
+  const startDate = start.toISOString().slice(0, 10);
+  const endDate = end.toISOString().slice(0, 10);
+
+  const transactions = await getTransactionsForOneItem(
+    itemRow,
+    startDate,
+    endDate
+  );
+
+  await applyTransactionSyncUpdates(userId, itemId, {
+    added: transactions,
+    modified: [],
+    removed: [],
+  });
+
+  console.log(`Initial sync complete: ${transactions.length} transactions`);
+
+  return transactions.length;
+}
+
 // =========================
 // Apply limiters before routes
 // =========================
@@ -1637,20 +1665,27 @@ app.post("/sync_transactions", async (req, res) => {
     const results = [];
 
     for (const item of items) {
-      const synced = await syncTransactionsForItem(item);
-      results.push(synced);
-    }
+  const syncState = await getItemSyncState(item.item_id);
 
-    res.json({
-      ok: true,
-      syncedItems: results.length,
-      results,
-    });
-  } catch (err) {
-    console.error("sync_transactions error:", err?.response?.data || err?.message || err);
-    res.status(500).json({ error: "Failed to sync transactions." });
+  let result;
+
+  if (!syncState) {
+    // FIRST TIME → FULL LOAD
+    console.log("🚀 Running initial full sync...");
+    const count = await initialFullTransactionSync(item);
+
+    result = {
+      item_id: item.item_id,
+      initial_sync: true,
+      added: count,
+    };
+  } else {
+    // NORMAL SYNC
+    result = await syncTransactionsForItem(item);
   }
-});
+
+  results.push(result);
+}
 
 app.post("/exchange_public_token", async (req, res) => {
   try {
