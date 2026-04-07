@@ -2380,11 +2380,11 @@ app.get("/spending_by_account", async (req, res) => {
   }
 });
 
-app.get("/debug_transaction_count", async (req, res) => {
+app.get("/debug_transactions_preview", async (req, res) => {
   try {
     const userId = getUserId(req);
 
-    const txCountResult = await pool.query(
+    const countResult = await pool.query(
       `
       SELECT COUNT(*)::int AS count
       FROM plaid_transactions
@@ -2393,23 +2393,34 @@ app.get("/debug_transaction_count", async (req, res) => {
       [userId]
     );
 
-    const itemCountResult = await pool.query(
+    const sampleResult = await pool.query(
       `
-      SELECT COUNT(*)::int AS count
-      FROM plaid_items
+      SELECT
+        transaction_id,
+        item_id,
+        account_id,
+        date,
+        name,
+        merchant_name,
+        amount,
+        pending,
+        category_primary
+      FROM plaid_transactions
       WHERE user_id = $1
+      ORDER BY date DESC
+      LIMIT 10
       `,
       [userId]
     );
 
     res.json({
       userId,
-      itemCount: itemCountResult.rows[0].count,
-      transactionCount: txCountResult.rows[0].count,
+      transactionCount: countResult.rows[0].count,
+      sample: sampleResult.rows,
     });
   } catch (err) {
-    console.error("debug_transaction_count error:", err?.message || err);
-    res.status(500).json({ error: "Failed to debug transaction count." });
+    console.error("debug_transactions_preview error:", err?.message || err);
+    res.status(500).json({ error: "Failed to preview transactions." });
   }
 });
 
