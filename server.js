@@ -1,5 +1,5 @@
 import express from "express";
-import rateLimit from "express-rate-limit"
+import rateLimit from "express-rate-limit";
 import cors from "cors";
 import dotenv from "dotenv";
 import plaid from "plaid";
@@ -15,6 +15,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const PORT = process.env.PORT || 3000;
+
+// =========================
+// Rate limiting
+// =========================
 const generalLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 120,
@@ -38,8 +43,6 @@ const aiLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: "Too many AI requests. Please wait a moment and try again." },
 });
-
-const PORT = process.env.PORT || 3000;
 
 // =========================
 // Plaid setup
@@ -89,32 +92,32 @@ async function initDatabase() {
   `);
 
   await pool.query(`
-  CREATE TABLE IF NOT EXISTS plaid_accounts (
-    account_id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    item_id TEXT NOT NULL,
-    institution_name TEXT,
-    name TEXT,
-    official_name TEXT,
-    mask TEXT,
-    type TEXT,
-    subtype TEXT,
-    current_balance DOUBLE PRECISION,
-    available_balance DOUBLE PRECISION,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
-  );
-`);
+    CREATE TABLE IF NOT EXISTS plaid_accounts (
+      account_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      item_id TEXT NOT NULL,
+      institution_name TEXT,
+      name TEXT,
+      official_name TEXT,
+      mask TEXT,
+      type TEXT,
+      subtype TEXT,
+      current_balance DOUBLE PRECISION,
+      available_balance DOUBLE PRECISION,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
 
-await pool.query(`
-  ALTER TABLE plaid_accounts
-  ADD COLUMN IF NOT EXISTS current_balance DOUBLE PRECISION;
-`);
+  await pool.query(`
+    ALTER TABLE plaid_accounts
+    ADD COLUMN IF NOT EXISTS current_balance DOUBLE PRECISION;
+  `);
 
-await pool.query(`
-  ALTER TABLE plaid_accounts
-  ADD COLUMN IF NOT EXISTS available_balance DOUBLE PRECISION;
-`);
+  await pool.query(`
+    ALTER TABLE plaid_accounts
+    ADD COLUMN IF NOT EXISTS available_balance DOUBLE PRECISION;
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS plaid_item_sync_state (
@@ -411,10 +414,7 @@ function buildCategoryChartData(transactions) {
   return items.map((item) => ({
     category: item.name,
     amount: item.amount,
-    percentage:
-      grandTotal > 0
-        ? Number(((item.amount / grandTotal) * 100).toFixed(1))
-        : 0,
+    percentage: grandTotal > 0 ? Number(((item.amount / grandTotal) * 100).toFixed(1)) : 0,
   }));
 }
 
@@ -1021,6 +1021,16 @@ async function deleteUserItem(userId, itemId) {
     `DELETE FROM plaid_accounts WHERE user_id = $1 AND item_id = $2`,
     [userId, itemId]
   );
+
+  await pool.query(
+    `DELETE FROM plaid_item_sync_state WHERE user_id = $1 AND item_id = $2`,
+    [userId, itemId]
+  );
+
+  await pool.query(
+    `DELETE FROM plaid_transactions WHERE user_id = $1 AND item_id = $2`,
+    [userId, itemId]
+  );
 }
 
 async function replaceAccountsForItem(userId, itemId, institutionName, accounts) {
@@ -1079,38 +1089,79 @@ async function replaceAccountsForItem(userId, itemId, institutionName, accounts)
   }
 }
 
-  for (const account of accounts) {
-    await pool.query(
+async function getAccountsForUser(userId, selectedItemIds = null, selectedAccountIds = null) {
+  if (selectedAccountIds && selectedAccountIds.length > 0) {
+    const result = await pool.query(
       `
-      INSERT INTO plaid_accounts (
-        account_id, user_id, item_id, institution_name, name, official_name, mask, type, subtype, updated_at
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
-      ON CONFLICT (account_id)
-      DO UPDATE SET
-        institution_name = EXCLUDED.institution_name,
-        name = EXCLUDED.name,
-        official_name = EXCLUDED.official_name,
-        mask = EXCLUDED.mask,
-        type = EXCLUDED.type,
-        subtype = EXCLUDED.subtype,
-        item_id = EXCLUDED.item_id,
-        updated_at = NOW()
+      SELECT
+        account_id,
+        user_id,
+        item_id,
+        institution_name,
+        name,
+        official_name,
+        mask,
+        type,
+        subtype,
+        current_balance,
+        available_balance
+      FROM plaid_accounts
+      WHERE user_id = $1 AND account_id = ANY($2::text[])
+      ORDER BY institution_name ASC, name ASC
       `,
-      [
-        account.account_id,
-        userId,
-        itemId,
-        institutionName,
-        account.name || null,
-        account.official_name || null,
-        account.mask || null,
-        account.type || null,
-        account.subtype || null,
-      ]
+      [userId, selectedAccountIds]
     );
+    return result.rows;
   }
+
+  if (selectedItemIds && selectedItemIds.length > 0) {
+    const result = await pool.query(
+      `
+      SELECT
+        account_id,
+        user_id,
+        item_id,
+        institution_name,
+        name,
+        official_name,
+        mask,
+        type,
+        subtype,
+        current_balance,
+        available_balance
+      FROM plaid_accounts
+      WHERE user_id = $1 AND item_id = ANY($2::text[])
+      ORDER BY institution_name ASC, name ASC
+      `,
+      [userId, selectedItemIds]
+    );
+    return result.rows;
+  }
+
+  const result = await pool.query(
+    `
+    SELECT
+      account_id,
+      user_id,
+      item_id,
+      institution_name,
+      name,
+      official_name,
+      mask,
+      type,
+      subtype,
+      current_balance,
+      available_balance
+    FROM plaid_accounts
+    WHERE user_id = $1
+    ORDER BY institution_name ASC, name ASC
+    `,
+    [userId]
+  );
+
+  return result.rows;
 }
+
 async function getItemSyncState(itemId) {
   const result = await pool.query(
     `
@@ -1319,107 +1370,6 @@ async function getStoredTransactionsForUser(
 // =========================
 // Plaid transaction helpers
 // =========================
-async function getTransactionsForOneItem(itemRow, startDate, endDate) {
-  const accessToken = itemRow.access_token;
-  const all = [];
-  let offset = 0;
-  const count = 100;
-
-  while (true) {
-    const response = await plaidClient.transactionsGet({
-      access_token: accessToken,
-      start_date: startDate,
-      end_date: endDate,
-      options: {
-        count,
-        offset,
-      },
-    });
-
-    const txs = response.data.transactions || [];
-    const accounts = response.data.accounts || [];
-
-    const annotated = txs.map((tx) => {
-      const matchedAccount = accounts.find((a) => a.account_id === tx.account_id);
-
-      return {
-        ...tx,
-        _item_id: itemRow.item_id,
-        _institution_name: itemRow.institution_name || null,
-        _account_name: matchedAccount?.name || null,
-        _account_mask: matchedAccount?.mask || null,
-      };
-    });
-
-    all.push(...annotated);
-
-    offset += txs.length;
-    if (all.length >= response.data.total_transactions) break;
-  }
-
-  return all;
-}
-
-async function getTransactionsForUser(userId, startDate, endDate, selectedItemIds = null, selectedAccountIds = null) {
-  const items = await getUserItemsFiltered(userId, selectedItemIds);
-  let allTransactions = [];
-
-  for (const item of items) {
-    const itemTx = await getTransactionsForOneItem(item, startDate, endDate);
-    allTransactions.push(...itemTx);
-  }
-
-  if (selectedAccountIds && selectedAccountIds.length > 0) {
-    allTransactions = allTransactions.filter((tx) => selectedAccountIds.includes(tx.account_id));
-  }
-
-  return allTransactions;
-}
-
-async function requireSelectionOrAll(req, res) {
-  const userId = getUserId(req);
-  const selectedItemIds = getSelectedItemIds(req);
-  const selectedAccountIds = getSelectedAccountIds(req);
-
-  const items = await getUserItemsFiltered(userId, selectedItemIds);
-
-  if (items.length === 0) {
-    res.status(401).json({ error: "No selected bank connected." });
-    return null;
-  }
-
-  if (selectedAccountIds && selectedAccountIds.length > 0) {
-    const accounts = await getAccountsForUser(userId, selectedItemIds, selectedAccountIds);
-    if (accounts.length === 0) {
-      res.status(401).json({ error: "No selected accounts found." });
-      return null;
-    }
-  }
-
-  
-async function requireSelectionOrAll(req, res) {
-  const userId = getUserId(req);
-  const selectedItemIds = getSelectedItemIds(req);
-  const selectedAccountIds = getSelectedAccountIds(req);
-
-  const items = await getUserItemsFiltered(userId, selectedItemIds);
-
-  if (items.length === 0) {
-    res.status(401).json({ error: "No selected bank connected." });
-    return null;
-  }
-
-  if (selectedAccountIds && selectedAccountIds.length > 0) {
-    const accounts = await getAccountsForUser(userId, selectedItemIds, selectedAccountIds);
-    if (accounts.length === 0) {
-      res.status(401).json({ error: "No selected accounts found." });
-      return null;
-    }
-  }
-
-  return { userId, selectedItemIds, selectedAccountIds, items };
-}
-
 async function syncTransactionsForItem(itemRow, webhookCode = null) {
   const userId = itemRow.user_id;
   const itemId = itemRow.item_id;
@@ -1492,6 +1442,32 @@ async function syncTransactionsForItem(itemRow, webhookCode = null) {
   };
 }
 
+async function requireSelectionOrAll(req, res) {
+  const userId = getUserId(req);
+  const selectedItemIds = getSelectedItemIds(req);
+  const selectedAccountIds = getSelectedAccountIds(req);
+
+  const items = await getUserItemsFiltered(userId, selectedItemIds);
+
+  if (items.length === 0) {
+    res.status(401).json({ error: "No selected bank connected." });
+    return null;
+  }
+
+  if (selectedAccountIds && selectedAccountIds.length > 0) {
+    const accounts = await getAccountsForUser(userId, selectedItemIds, selectedAccountIds);
+    if (accounts.length === 0) {
+      res.status(401).json({ error: "No selected accounts found." });
+      return null;
+    }
+  }
+
+  return { userId, selectedItemIds, selectedAccountIds, items };
+}
+
+// =========================
+// Apply limiters before routes
+// =========================
 app.use("/", generalLimiter);
 app.use("/health", generalLimiter);
 app.use("/connection_status", generalLimiter);
@@ -1507,12 +1483,13 @@ app.use("/spending_by_account", generalLimiter);
 app.use("/create_link_token", plaidLimiter);
 app.use("/exchange_public_token", plaidLimiter);
 app.use("/sync_connected_accounts", plaidLimiter);
+app.use("/sync_transactions", plaidLimiter);
 app.use("/disconnect_bank", plaidLimiter);
 app.use("/plaid/webhook", plaidLimiter);
 
 app.use("/ai_recommendations", aiLimiter);
 app.use("/ask_budget_ai", aiLimiter);
-  
+
 // =========================
 // Routes
 // =========================
@@ -1628,7 +1605,6 @@ app.post("/create_link_token", async (req, res) => {
       language: "en",
     };
 
-    // Only attach webhook if it exists
     if (process.env.PLAID_WEBHOOK_URL) {
       requestBody.webhook = process.env.PLAID_WEBHOOK_URL;
     }
@@ -1736,7 +1712,7 @@ app.post("/exchange_public_token", async (req, res) => {
       console.error("accountsGet warning:", err?.response?.data || err?.message || err);
     }
 
-      try {
+    try {
       const linkedItem = await getUserItemByItemId(userId, itemId);
       if (linkedItem) {
         await syncTransactionsForItem(linkedItem);
@@ -1803,7 +1779,7 @@ app.get("/alerts", async (req, res) => {
     const currentRange = getDateRangeLast30Days();
     const previousRange = getPrevious30DayRange();
 
-    const currentTransactions = (await getTransactionsForUser(
+    const currentTransactions = (await getStoredTransactionsForUser(
       userId,
       currentRange.start,
       currentRange.end,
@@ -1811,7 +1787,7 @@ app.get("/alerts", async (req, res) => {
       selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
-    const previousTransactions = (await getTransactionsForUser(
+    const previousTransactions = (await getStoredTransactionsForUser(
       userId,
       previousRange.start,
       previousRange.end,
@@ -1845,7 +1821,7 @@ app.get("/insights", async (req, res) => {
     const { userId, selectedItemIds, selectedAccountIds } = ctx;
     const range = getDateRangeLast30Days();
 
-    const transactions = (await getTransactionsForUser(
+    const transactions = (await getStoredTransactionsForUser(
       userId,
       range.start,
       range.end,
@@ -1927,7 +1903,7 @@ app.get("/money_insights", async (req, res) => {
     const previousRange = getPrevious30DayRange();
     const sixMonthRange = getDateRangeLastSixMonths();
 
-    const currentTransactions = (await getTransactionsForUser(
+    const currentTransactions = (await getStoredTransactionsForUser(
       userId,
       currentRange.start,
       currentRange.end,
@@ -1935,7 +1911,7 @@ app.get("/money_insights", async (req, res) => {
       selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
-    const previousTransactions = (await getTransactionsForUser(
+    const previousTransactions = (await getStoredTransactionsForUser(
       userId,
       previousRange.start,
       previousRange.end,
@@ -1943,7 +1919,7 @@ app.get("/money_insights", async (req, res) => {
       selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
-    const sixMonthTransactions = (await getTransactionsForUser(
+    const sixMonthTransactions = (await getStoredTransactionsForUser(
       userId,
       sixMonthRange.start,
       sixMonthRange.end,
@@ -1976,7 +1952,7 @@ app.get("/category_chart", async (req, res) => {
     const { userId, selectedItemIds, selectedAccountIds } = ctx;
     const range = getDateRangeLast30Days();
 
-    const transactions = (await getTransactionsForUser(
+    const transactions = (await getStoredTransactionsForUser(
       userId,
       range.start,
       range.end,
@@ -2005,7 +1981,7 @@ app.get("/weekly_summary", async (req, res) => {
     const currentWeekRange = getDateRangeLast7Days();
     const previousWeekRange = getPrevious7DayRange();
 
-    const currentWeekTransactions = (await getTransactionsForUser(
+    const currentWeekTransactions = (await getStoredTransactionsForUser(
       userId,
       currentWeekRange.start,
       currentWeekRange.end,
@@ -2013,7 +1989,7 @@ app.get("/weekly_summary", async (req, res) => {
       selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
-    const previousWeekTransactions = (await getTransactionsForUser(
+    const previousWeekTransactions = (await getStoredTransactionsForUser(
       userId,
       previousWeekRange.start,
       previousWeekRange.end,
@@ -2045,7 +2021,7 @@ app.get("/ai_recommendations", async (req, res) => {
     const previousRange = getPrevious30DayRange();
     const sixMonthRange = getDateRangeLastSixMonths();
 
-    const currentTransactions = (await getTransactionsForUser(
+    const currentTransactions = (await getStoredTransactionsForUser(
       userId,
       currentRange.start,
       currentRange.end,
@@ -2053,7 +2029,7 @@ app.get("/ai_recommendations", async (req, res) => {
       selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
-    const previousTransactions = (await getTransactionsForUser(
+    const previousTransactions = (await getStoredTransactionsForUser(
       userId,
       previousRange.start,
       previousRange.end,
@@ -2061,7 +2037,7 @@ app.get("/ai_recommendations", async (req, res) => {
       selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
-    const sixMonthTransactions = (await getTransactionsForUser(
+    const sixMonthTransactions = (await getStoredTransactionsForUser(
       userId,
       sixMonthRange.start,
       sixMonthRange.end,
@@ -2171,7 +2147,7 @@ app.post("/ask_budget_ai", async (req, res) => {
     const previousRange = getPrevious30DayRange();
     const sixMonthRange = getDateRangeLastSixMonths();
 
-    const currentTransactions = (await getTransactionsForUser(
+    const currentTransactions = (await getStoredTransactionsForUser(
       userId,
       currentRange.start,
       currentRange.end,
@@ -2179,7 +2155,7 @@ app.post("/ask_budget_ai", async (req, res) => {
       selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
-    const previousTransactions = (await getTransactionsForUser(
+    const previousTransactions = (await getStoredTransactionsForUser(
       userId,
       previousRange.start,
       previousRange.end,
@@ -2187,7 +2163,7 @@ app.post("/ask_budget_ai", async (req, res) => {
       selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
-    const sixMonthTransactions = (await getTransactionsForUser(
+    const sixMonthTransactions = (await getStoredTransactionsForUser(
       userId,
       sixMonthRange.start,
       sixMonthRange.end,
@@ -2225,13 +2201,12 @@ app.post("/plaid/webhook", async (req, res) => {
   try {
     const body = req.body;
 
-    console.log("🔔 Plaid webhook received:", {
+    console.log("Plaid webhook received:", {
       webhook_type: body.webhook_type,
       webhook_code: body.webhook_code,
       item_id: body.item_id,
     });
 
-    // Only care about transaction updates
     if (
       body.webhook_type === "TRANSACTIONS" &&
       body.webhook_code === "SYNC_UPDATES_AVAILABLE" &&
@@ -2250,14 +2225,13 @@ app.post("/plaid/webhook", async (req, res) => {
       const item = result.rows[0];
 
       if (item) {
-        console.log("🔄 Syncing transactions for item:", item.item_id);
-        await syncTransactionsForItem(item);
+        await syncTransactionsForItem(item, body.webhook_code);
       }
     }
 
     res.sendStatus(200);
   } catch (err) {
-    console.error("❌ plaid webhook error:", err?.message || err);
+    console.error("plaid webhook error:", err?.response?.data || err?.message || err);
     res.sendStatus(200);
   }
 });
@@ -2270,7 +2244,7 @@ app.get("/spending_by_account", async (req, res) => {
     const { userId, selectedItemIds, selectedAccountIds } = ctx;
     const range = getDateRangeLast30Days();
 
-    const transactions = (await getTransactionsForUser(
+    const transactions = (await getStoredTransactionsForUser(
       userId,
       range.start,
       range.end,
