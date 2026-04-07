@@ -354,6 +354,8 @@ function buildTransactionsByMonth(transactions, start, end) {
   const groups = {};
 
   for (const tx of transactions) {
+    if (!tx.date) continue;
+
     const key = monthKeyFromDateString(tx.date);
     if (!groups[key]) groups[key] = [];
 
@@ -361,7 +363,7 @@ function buildTransactionsByMonth(transactions, start, end) {
       id: tx.transaction_id,
       name: tx.name || "Unknown",
       date: tx.date,
-      amount: Number(tx.amount.toFixed(2)),
+      amount: Number((tx.amount ?? 0).toFixed(2)),
       category: formatCategoryName(getCategory(tx)),
       institutionName: tx._institution_name || null,
       accountName: tx._account_name || null,
@@ -376,7 +378,7 @@ function buildTransactionsByMonth(transactions, start, end) {
       month,
       totalSpent: Number(txs.reduce((sum, t) => sum + t.amount, 0).toFixed(2)),
       count: txs.length,
-      transactions: txs.sort((a, b) => b.date.localeCompare(a.date)),
+      transactions: txs.sort((a, b) => (b.date || "").localeCompare(a.date || "")),
     }))
     .sort((a, b) => b.month.localeCompare(a.month));
 
