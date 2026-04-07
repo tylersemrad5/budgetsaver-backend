@@ -116,6 +116,49 @@ await pool.query(`
   ADD COLUMN IF NOT EXISTS available_balance DOUBLE PRECISION;
 `);
 
+    await pool.query(`
+    CREATE TABLE IF NOT EXISTS plaid_item_sync_state (
+      item_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      transactions_cursor TEXT,
+      last_webhook_code TEXT,
+      last_synced_at TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS plaid_transactions (
+      transaction_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      item_id TEXT NOT NULL,
+      account_id TEXT NOT NULL,
+      date DATE,
+      name TEXT,
+      merchant_name TEXT,
+      amount DOUBLE PRECISION,
+      pending BOOLEAN,
+      category_primary TEXT,
+      raw_json JSONB,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_plaid_transactions_user_date
+    ON plaid_transactions (user_id, date DESC);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_plaid_transactions_user_account
+    ON plaid_transactions (user_id, account_id);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_plaid_transactions_user_item
+    ON plaid_transactions (user_id, item_id);
+  `);
+
   console.log("Database initialized");
 }
 
@@ -1068,6 +1111,145 @@ async function replaceAccountsForItem(userId, itemId, institutionName, accounts)
   }
 }
 
+async function getItemSyncState(itemId) {
+  const result = await pool.query(
+    `
+    SELECT item_id, user_id, transactions_cursor, last_webhook_code, last_synced_at
+    FROM plaid_item_sync_state
+    WHERE item_id = $1
+    LIMIT 1
+    `,
+    [itemId]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function upsertItemSyncState(userId, itemId, cursor, webhookCode = null) {
+  await pool.query(
+    `
+    INSERT INTO plaid_item_sync_state (
+      item_id, user_id, transactions_cursor, last_webhook_code, last_synced_at, updated_at
+    )
+    VALUES ($1, $2, $3, $4, NOW(), NOW())
+    ON CONFLICT (item_id)
+    DO UPDATE SET
+      transactions_cursor = EXCLUDED.transactions_cursor,
+      last_webhook_code = COALESCE(EXCLUDED.last_webhook_code, plaid_item_sync_state.last_webhook_code),
+      last_synced_at = NOW(),
+      updated_at = NOW()
+    `,
+    [itemId, userId, cursor, webhookCode]
+  );
+}
+
+async function applyTransactionSyncUpdates(userId, itemId, syncData) {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    for (const tx of syncData.added || []) {
+      await client.query(
+        `
+        INSERT INTO plaid_transactions (
+          transaction_id,
+          user_id,
+          item_id,
+          account_id,
+          date,
+          name,
+          merchant_name,
+          amount,
+          pending,
+          category_primary,
+          raw_json,
+          updated_at
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+        ON CONFLICT (transaction_id)
+        DO UPDATE SET
+          user_id = EXCLUDED.user_id,
+          item_id = EXCLUDED.item_id,
+          account_id = EXCLUDED.account_id,
+          date = EXCLUDED.date,
+          name = EXCLUDED.name,
+          merchant_name = EXCLUDED.merchant_name,
+          amount = EXCLUDED.amount,
+          pending = EXCLUDED.pending,
+          category_primary = EXCLUDED.category_primary,
+          raw_json = EXCLUDED.raw_json,
+          updated_at = NOW()
+        `,
+        [
+          tx.transaction_id,
+          userId,
+          itemId,
+          tx.account_id,
+          tx.date || null,
+          tx.name || null,
+          tx.merchant_name || null,
+          tx.amount ?? null,
+          tx.pending ?? null,
+          tx.personal_finance_category?.primary || null,
+          JSON.stringify(tx),
+        ]
+      );
+    }
+
+    for (const tx of syncData.modified || []) {
+      await client.query(
+        `
+        UPDATE plaid_transactions
+        SET
+          user_id = $2,
+          item_id = $3,
+          account_id = $4,
+          date = $5,
+          name = $6,
+          merchant_name = $7,
+          amount = $8,
+          pending = $9,
+          category_primary = $10,
+          raw_json = $11,
+          updated_at = NOW()
+        WHERE transaction_id = $1
+        `,
+        [
+          tx.transaction_id,
+          userId,
+          itemId,
+          tx.account_id,
+          tx.date || null,
+          tx.name || null,
+          tx.merchant_name || null,
+          tx.amount ?? null,
+          tx.pending ?? null,
+          tx.personal_finance_category?.primary || null,
+          JSON.stringify(tx),
+        ]
+      );
+    }
+
+    for (const removed of syncData.removed || []) {
+      await client.query(
+        `
+        DELETE FROM plaid_transactions
+        WHERE transaction_id = $1 AND user_id = $2
+        `,
+        [removed.transaction_id, userId]
+      );
+    }
+
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 async function getAccountsForUser(userId, selectedItemIds = null, selectedAccountIds = null) {
   if (selectedAccountIds && selectedAccountIds.length > 0) {
     const result = await pool.query(
@@ -1139,6 +1321,72 @@ async function getAccountsForUser(userId, selectedItemIds = null, selectedAccoun
   );
 
   return result.rows;
+}
+
+async function getStoredTransactionsForUser(
+  userId,
+  startDate,
+  endDate,
+  selectedItemIds = null,
+  selectedAccountIds = null
+) {
+  let query = `
+    SELECT
+      t.transaction_id,
+      t.account_id,
+      t.item_id AS _item_id,
+      t.date,
+      t.name,
+      t.merchant_name,
+      t.amount,
+      t.pending,
+      t.category_primary,
+      a.institution_name AS _institution_name,
+      a.name AS _account_name,
+      a.mask AS _account_mask
+    FROM plaid_transactions t
+    LEFT JOIN plaid_accounts a
+      ON t.account_id = a.account_id
+    WHERE t.user_id = $1
+      AND t.date >= $2
+      AND t.date <= $3
+  `;
+
+  const params = [userId, startDate, endDate];
+  let idx = 4;
+
+  if (selectedItemIds && selectedItemIds.length > 0) {
+    query += ` AND t.item_id = ANY($${idx}::text[])`;
+    params.push(selectedItemIds);
+    idx += 1;
+  }
+
+  if (selectedAccountIds && selectedAccountIds.length > 0) {
+    query += ` AND t.account_id = ANY($${idx}::text[])`;
+    params.push(selectedAccountIds);
+    idx += 1;
+  }
+
+  query += ` ORDER BY t.date DESC`;
+
+  const result = await pool.query(query, params);
+
+  return result.rows.map((row) => ({
+    transaction_id: row.transaction_id,
+    account_id: row.account_id,
+    _item_id: row._item_id,
+    date: row.date,
+    name: row.name,
+    merchant_name: row.merchant_name,
+    amount: row.amount,
+    pending: row.pending,
+    personal_finance_category: row.category_primary
+      ? { primary: row.category_primary }
+      : null,
+    _institution_name: row._institution_name || null,
+    _account_name: row._account_name || null,
+    _account_mask: row._account_mask || null,
+  }));
 }
 
 // =========================
@@ -1221,6 +1469,77 @@ async function requireSelectionOrAll(req, res) {
     }
   }
 
+  
+async function syncTransactionsForItem(itemRow, webhookCode = null) {
+  const userId = itemRow.user_id;
+  const itemId = itemRow.item_id;
+
+  const syncState = await getItemSyncState(itemId);
+  const originalCursor = syncState?.transactions_cursor || null;
+
+  let cursor = originalCursor;
+  let nextCursor = originalCursor;
+  let hasMore = true;
+
+  const accumulated = {
+    added: [],
+    modified: [],
+    removed: [],
+  };
+
+  while (hasMore) {
+    try {
+      const response = await plaidClient.transactionsSync({
+        access_token: itemRow.access_token,
+        cursor,
+      });
+
+      const data = response.data;
+
+      accumulated.added.push(...(data.added || []));
+      accumulated.modified.push(...(data.modified || []));
+      accumulated.removed.push(...(data.removed || []));
+
+      nextCursor = data.next_cursor;
+      hasMore = data.has_more;
+      cursor = data.next_cursor;
+    } catch (err) {
+      const errorCode = err?.response?.data?.error_code;
+      const errorType = err?.response?.data?.error_type;
+      const requestId = err?.response?.data?.request_id;
+
+      console.error("transactionsSync error:", {
+        itemId,
+        errorCode,
+        errorType,
+        requestId,
+        message: err?.message,
+      });
+
+      // Plaid recommends restarting the entire pagination loop if a mutation-during-pagination
+      // error happens while paging through /transactions/sync updates.
+      if (errorCode === "TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION") {
+        return await syncTransactionsForItem(
+          { ...itemRow, _restartCursor: originalCursor },
+          webhookCode
+        );
+      }
+
+      throw err;
+    }
+  }
+
+  await applyTransactionSyncUpdates(userId, itemId, accumulated);
+  await upsertItemSyncState(userId, itemId, nextCursor, webhookCode);
+
+  return {
+    item_id: itemId,
+    added: accumulated.added.length,
+    modified: accumulated.modified.length,
+    removed: accumulated.removed.length,
+    next_cursor: nextCursor,
+  };
+}
   return { userId, selectedItemIds, selectedAccountIds, items };
 }
 
@@ -1329,7 +1648,7 @@ app.post("/create_link_token", async (req, res) => {
   try {
     const userId = getUserId(req);
 
-    const response = await plaidClient.linkTokenCreate({
+    const requestBody = {
       user: {
         client_user_id: userId,
       },
@@ -1337,7 +1656,14 @@ app.post("/create_link_token", async (req, res) => {
       products: ["transactions"],
       country_codes: ["US"],
       language: "en",
-    });
+    };
+
+    // Only attach webhook if it exists
+    if (process.env.PLAID_WEBHOOK_URL) {
+      requestBody.webhook = process.env.PLAID_WEBHOOK_URL;
+    }
+
+    const response = await plaidClient.linkTokenCreate(requestBody);
 
     res.json({
       link_token: response.data.link_token,
@@ -1348,6 +1674,35 @@ app.post("/create_link_token", async (req, res) => {
       error: "Failed to create link token.",
       details: err?.response?.data || err?.message || "Unknown error",
     });
+  }
+});
+
+app.post("/sync_transactions", async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const selectedItemIds = getSelectedItemIds(req);
+
+    const items = await getUserItemsFiltered(userId, selectedItemIds);
+
+    if (items.length === 0) {
+      return res.status(404).json({ error: "No connected items found." });
+    }
+
+    const results = [];
+
+    for (const item of items) {
+      const synced = await syncTransactionsForItem(item);
+      results.push(synced);
+    }
+
+    res.json({
+      ok: true,
+      syncedItems: results.length,
+      results,
+    });
+  } catch (err) {
+    console.error("sync_transactions error:", err?.response?.data || err?.message || err);
+    res.status(500).json({ error: "Failed to sync transactions." });
   }
 });
 
@@ -1887,6 +2242,47 @@ app.post("/ask_budget_ai", async (req, res) => {
   }
 });
 
+app.post("/plaid/webhook", async (req, res) => {
+  try {
+    const body = req.body;
+
+    console.log("🔔 Plaid webhook received:", {
+      webhook_type: body.webhook_type,
+      webhook_code: body.webhook_code,
+      item_id: body.item_id,
+    });
+
+    // Only care about transaction updates
+    if (
+      body.webhook_type === "TRANSACTIONS" &&
+      body.webhook_code === "SYNC_UPDATES_AVAILABLE" &&
+      body.item_id
+    ) {
+      const result = await pool.query(
+        `
+        SELECT id, user_id, item_id, access_token, institution_id, institution_name
+        FROM plaid_items
+        WHERE item_id = $1
+        LIMIT 1
+        `,
+        [body.item_id]
+      );
+
+      const item = result.rows[0];
+
+      if (item) {
+        console.log("🔄 Syncing transactions for item:", item.item_id);
+        await syncTransactionsForItem(item);
+      }
+    }
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("❌ plaid webhook error:", err?.message || err);
+    res.sendStatus(200);
+  }
+});
+
 app.get("/spending_by_account", async (req, res) => {
   try {
     const ctx = await requireSelectionOrAll(req, res);
@@ -1967,6 +2363,8 @@ app.use("/plaid/webhook", plaidLimiter);
 
 app.use("/ai_recommendations", aiLimiter);
 app.use("/ask_budget_ai", aiLimiter);
+
+
 
 // =========================
 // Start server
