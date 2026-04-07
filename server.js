@@ -350,19 +350,39 @@ function monthDisplay(monthKey) {
   }).format(date);
 }
 
+function safeDateString(value) {
+  if (!value) return null;
+
+  if (typeof value === "string") {
+    return value.slice(0, 10);
+  }
+
+  if (value instanceof Date) {
+    return value.toISOString().slice(0, 10);
+  }
+
+  const parsed = new Date(value);
+  if (!Number.isNaN(parsed.getTime())) {
+    return parsed.toISOString().slice(0, 10);
+  }
+
+  return null;
+}
+
 function buildTransactionsByMonth(transactions, start, end) {
   const groups = {};
 
   for (const tx of transactions) {
-    if (!tx.date) continue;
+    const normalizedDate = safeDateString(tx.date);
+    if (!normalizedDate) continue;
 
-    const key = monthKeyFromDateString(tx.date);
+    const key = monthKeyFromDateString(normalizedDate);
     if (!groups[key]) groups[key] = [];
 
     groups[key].push({
       id: tx.transaction_id,
       name: tx.name || "Unknown",
-      date: tx.date,
+      date: normalizedDate,
       amount: Number((tx.amount ?? 0).toFixed(2)),
       category: formatCategoryName(getCategory(tx)),
       institutionName: tx._institution_name || null,
@@ -378,7 +398,7 @@ function buildTransactionsByMonth(transactions, start, end) {
       month,
       totalSpent: Number(txs.reduce((sum, t) => sum + t.amount, 0).toFixed(2)),
       count: txs.length,
-      transactions: txs.sort((a, b) => (b.date || "").localeCompare(a.date || "")),
+      transactions: txs.sort((a, b) => b.date.localeCompare(a.date)),
     }))
     .sort((a, b) => b.month.localeCompare(a.month));
 
