@@ -162,6 +162,19 @@ async function initDatabase() {
     ON plaid_transactions (user_id, item_id);
   `);
 
+    await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_budgets (
+      id SERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      month_key TEXT NOT NULL,
+      category_name TEXT NOT NULL,
+      budget_amount DOUBLE PRECISION NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(user_id, month_key, category_name)
+    );
+  `);
+
   console.log("Database initialized");
 }
 
@@ -1704,6 +1717,136 @@ async function getStoredTransactionsForUser(
   }));
 }
 
+function getCurrentMonthKey() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  return `${year}-${month}`;
+}
+
+async function getBudgetsForMonth(userId, monthKey) {
+  const result = await pool.query(
+    `
+    SELECT category_name, budget_amount
+    FROM user_budgets
+    WHERE user_id = $1 AND month_key = $2
+    ORDER BY category_name ASC
+    `,
+    [userId, monthKey]
+  );
+
+  return result.rows;
+}
+
+async function upsertBudgetsForMonth(userId, monthKey, budgets) {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    for (const budget of budgets) {
+      const categoryName = String(budget.category_name || "").trim();
+      const budgetAmount = Number(budget.budget_amount);
+
+      if (!categoryName || !Number.isFinite(budgetAmount) || budgetAmount < 0) {
+        continue;
+      }
+
+      await client.query(
+        `
+        INSERT INTO user_budgets (
+          user_id, month_key, category_name, budget_amount, updated_at
+        )
+        VALUES ($1, $2, $3, $4, NOW())
+        ON CONFLICT (user_id, month_key, category_name)
+        DO UPDATE SET
+          budget_amount = EXCLUDED.budget_amount,
+          updated_at = NOW()
+        `,
+        [userId, monthKey, categoryName, budgetAmount]
+      );
+    }
+
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+function buildBudgetProgress(spentByCategoryRaw, savedBudgets) {
+  const savedMap = {};
+  for (const row of savedBudgets) {
+    savedMap[row.category_name] = Number(row.budget_amount);
+  }
+
+  const allCategories = new Set([
+    ...Object.keys(spentByCategoryRaw),
+    ...Object.keys(savedMap),
+  ]);
+
+  const categoryProgress = Array.from(allCategories)
+    .map((category) => {
+      const spent = Number((spentByCategoryRaw[category] || 0).toFixed(2));
+      const budget = Number((savedMap[category] || 0).toFixed(2));
+      const remaining = Number((budget - spent).toFixed(2));
+      const percentUsed = budget > 0 ? Number(((spent / budget) * 100).toFixed(1)) : 0;
+
+      let status = "no_budget";
+      if (budget > 0 && spent > budget) {
+        status = "over";
+      } else if (budget > 0 && percentUsed >= 80) {
+        status = "warning";
+      } else if (budget > 0) {
+        status = "good";
+      }
+
+      return {
+        category,
+        budget,
+        spent,
+        remaining,
+        percentUsed,
+        status,
+      };
+    })
+    .sort((a, b) => {
+      if (a.status === "over" && b.status !== "over") return -1;
+      if (a.status !== "over" && b.status === "over") return 1;
+      return b.spent - a.spent;
+    });
+
+  const totalBudget = Number(
+    categoryProgress.reduce((sum, row) => sum + row.budget, 0).toFixed(2)
+  );
+  const totalSpent = Number(
+    categoryProgress.reduce((sum, row) => sum + row.spent, 0).toFixed(2)
+  );
+  const totalRemaining = Number((totalBudget - totalSpent).toFixed(2));
+  const totalPercentUsed =
+    totalBudget > 0 ? Number(((totalSpent / totalBudget) * 100).toFixed(1)) : 0;
+
+  let overallStatus = "no_budget";
+  if (totalBudget > 0 && totalSpent > totalBudget) {
+    overallStatus = "over";
+  } else if (totalBudget > 0 && totalPercentUsed >= 80) {
+    overallStatus = "warning";
+  } else if (totalBudget > 0) {
+    overallStatus = "good";
+  }
+
+  return {
+    totalBudget,
+    totalSpent,
+    totalRemaining,
+    totalPercentUsed,
+    overallStatus,
+    categoryProgress,
+  };
+}
+
 // =========================
 // Plaid transaction helpers
 // =========================
@@ -2194,6 +2337,50 @@ app.get("/alerts", async (req, res) => {
   }
 });
 
+app.get("/budgets", async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const monthKey = String(req.query.monthKey || getCurrentMonthKey());
+
+    const budgets = await getBudgetsForMonth(userId, monthKey);
+
+    res.json({
+      monthKey,
+      budgets: budgets.map((row) => ({
+        category_name: row.category_name,
+        budget_amount: Number(row.budget_amount),
+      })),
+    });
+  } catch (err) {
+    console.error("budgets GET error:", err?.message || err);
+    res.status(500).json({ error: "Failed to load budgets." });
+  }
+});
+
+app.post("/budgets", async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const monthKey = String(req.body?.monthKey || getCurrentMonthKey());
+    const budgets = Array.isArray(req.body?.budgets) ? req.body.budgets : [];
+
+    await upsertBudgetsForMonth(userId, monthKey, budgets);
+
+    const savedBudgets = await getBudgetsForMonth(userId, monthKey);
+
+    res.json({
+      ok: true,
+      monthKey,
+      budgets: savedBudgets.map((row) => ({
+        category_name: row.category_name,
+        budget_amount: Number(row.budget_amount),
+      })),
+    });
+  } catch (err) {
+    console.error("budgets POST error:", err?.message || err);
+    res.status(500).json({ error: "Failed to save budgets." });
+  }
+});
+
 app.get("/insights", async (req, res) => {
   try {
     const ctx = await requireSelectionOrAll(req, res);
@@ -2201,8 +2388,9 @@ app.get("/insights", async (req, res) => {
 
     const { userId, selectedItemIds, selectedAccountIds } = ctx;
     const range = getDateRangeLast30Days();
+    const monthKey = getCurrentMonthKey();
 
-    const transactions = (await getStoredTransactionsForUser(
+    const transactions = (await getTransactionsForUser(
       userId,
       range.start,
       range.end,
@@ -2213,28 +2401,17 @@ app.get("/insights", async (req, res) => {
     const spentByCategoryRaw = sumByCategory(transactions);
     const totalSpent = transactions.reduce((sum, tx) => sum + tx.amount, 0);
 
-    const budgetByCategory = {};
-    const spentByCategory = {};
-    const remainingByCategory = {};
-
-    for (const [category, spent] of Object.entries(spentByCategoryRaw)) {
-      const budget = Math.max(spent * 1.2, spent + 25);
-      budgetByCategory[category] = Number(budget.toFixed(2));
-      spentByCategory[category] = Number(spent.toFixed(2));
-      remainingByCategory[category] = Number((budget - spent).toFixed(2));
-    }
+    const savedBudgets = await getBudgetsForMonth(userId, monthKey);
+    const budgetProgress = buildBudgetProgress(spentByCategoryRaw, savedBudgets);
 
     res.json({
       month: getCurrentMonthLabel(),
+      monthKey,
       totals: {
         total_transactions: transactions.length,
         spent: Number(totalSpent.toFixed(2)),
       },
-      budgets: {
-        budgetByCategory,
-        spentByCategory,
-        remainingByCategory,
-      },
+      budgetProgress,
       selectedItemCount: selectedItemIds?.length || null,
       selectedAccountCount: selectedAccountIds?.length || null,
     });
