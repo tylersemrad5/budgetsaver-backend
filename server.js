@@ -192,6 +192,14 @@ function getUserId(req) {
   return req.header("X-USER-ID") || "tyler_local_user";
 }
 
+async function getTransactionsForUser(userId) {
+  const results = await pool.query(
+    "SELECT * FROM transactions WHERE user_id = $1",
+    [userId]
+  );
+  return results.rows;
+}
+
 function parseHeaderList(req, headerName) {
   const headerValue = req.header(headerName);
   if (!headerValue) return null;
