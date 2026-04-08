@@ -2487,17 +2487,19 @@ app.get("/money_insights", async (req, res) => {
       selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
-    const insightData = buildMoneyInsights(
-      currentTransactions,
-      previousTransactions,
-      sixMonthTransactions
-    );
+   const insightData = buildMoneyInsights(
+  currentTransactions,
+  previousTransactions,
+  sixMonthTransactions
+  );
 
-    res.json({
-      ...insightData,
-      selectedItemCount: selectedItemIds?.length || null,
-      selectedAccountCount: selectedAccountIds?.length || null,
-    });
+  console.log("money_insights insightData:", JSON.stringify(insightData, null, 2));
+
+  res.json({
+    ...insightData,
+    selectedItemCount: selectedItemIds?.length || null,
+    selectedAccountCount: selectedAccountIds?.length || null,
+  });
   } catch (err) {
     console.error("money_insights error:", err?.response?.data || err?.message || err);
     res.status(500).json({ error: "Failed to build money insights." });
