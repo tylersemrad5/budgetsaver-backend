@@ -1,7 +1,7 @@
 import express from "express";
-import rateLimit from "express-rate-limit";
 import cors from "cors";
 import dotenv from "dotenv";
+import rateLimit from "express-rate-limit";
 import plaid from "plaid";
 import pg from "pg";
 import OpenAI from "openai";
@@ -12,8 +12,10 @@ const { Configuration, PlaidApi, PlaidEnvironments } = plaid;
 const { Pool } = pg;
 
 const app = express();
+app.set("trust proxy", 1);
+
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 3000;
 
@@ -22,7 +24,7 @@ const PORT = process.env.PORT || 3000;
 // =========================
 const generalLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 120,
+  max: 180,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many requests. Please try again in a minute." },
@@ -30,7 +32,7 @@ const generalLimiter = rateLimit({
 
 const plaidLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 40,
+  max: 60,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many Plaid requests. Please slow down and try again." },
@@ -38,10 +40,10 @@ const plaidLimiter = rateLimit({
 
 const aiLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 20,
+  max: 25,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: "Too many AI requests. Please wait a moment and try again." },
+  message: { error: "Too many AI requests. Please wait and try again." },
 });
 
 // =========================
@@ -77,6 +79,242 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
 });
 
+// =========================
+// OpenAI
+// =========================
+const openai = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
+
+// =========================
+// App constants
+// =========================
+const DEFAULT_USER_ID = "tyler_local_user";
+
+const FIXED_CATEGORIES = new Set([
+  "LOAN_PAYMENTS",
+  "RENT_AND_UTILITIES",
+  "INSURANCE",
+  "TRANSFER_OUT",
+  "BANK_FEES",
+]);
+
+const ESSENTIAL_CATEGORIES = new Set([
+  "FOOD_AND_DRINK",
+  "TRANSPORTATION",
+  "PERSONAL_CARE",
+  "MEDICAL",
+  "RENT_AND_UTILITIES",
+  "LOAN_PAYMENTS",
+  "INSURANCE",
+]);
+
+const NON_ACTIONABLE_CATEGORIES = new Set([
+  "LOAN_PAYMENTS",
+  "TRANSFER_OUT",
+  "BANK_FEES",
+  "INCOME",
+  "TRANSFER_IN",
+]);
+
+const SUBSCRIPTION_KEYWORDS = [
+  "NETFLIX",
+  "SPOTIFY",
+  "APPLE",
+  "HULU",
+  "MAX",
+  "DISNEY",
+  "YOUTUBE",
+  "AMAZON PRIME",
+  "PARAMOUNT",
+  "PEACOCK",
+  "OTTER",
+  "OPENAI",
+  "CHATGPT",
+];
+
+// =========================
+// Generic helpers
+// =========================
+function getUserId(req) {
+  return req.header("X-USER-ID") || DEFAULT_USER_ID;
+}
+
+function parseHeaderList(req, headerName) {
+  const value = req.header(headerName);
+  if (!value) return null;
+
+  const parts = value
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  return parts.length ? parts : null;
+}
+
+function getSelectedItemIds(req) {
+  return parseHeaderList(req, "X-SELECTED-ITEM-IDS");
+}
+
+function getSelectedAccountIds(req) {
+  return parseHeaderList(req, "X-SELECTED-ACCOUNT-IDS");
+}
+
+function formatDate(date) {
+  return new Date(date).toISOString().slice(0, 10);
+}
+
+function today() {
+  return formatDate(new Date());
+}
+
+function addDays(dateLike, days) {
+  const d = new Date(dateLike);
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
+function getDateRangeLast30Days() {
+  const end = new Date();
+  const start = addDays(end, -30);
+  return { start: formatDate(start), end: formatDate(end) };
+}
+
+function getPrevious30DayRange() {
+  const end = addDays(new Date(), -30);
+  const start = addDays(end, -30);
+  return { start: formatDate(start), end: formatDate(end) };
+}
+
+function getDateRangeLast7Days() {
+  const end = new Date();
+  const start = addDays(end, -7);
+  return { start: formatDate(start), end: formatDate(end) };
+}
+
+function getPrevious7DayRange() {
+  const end = addDays(new Date(), -7);
+  const start = addDays(end, -7);
+  return { start: formatDate(start), end: formatDate(end) };
+}
+
+function getDateRangeLastSixMonths() {
+  const end = new Date();
+  const start = new Date();
+  start.setMonth(end.getMonth() - 5);
+  start.setDate(1);
+  return { start: formatDate(start), end: formatDate(end) };
+}
+
+function monthKeyFromDateString(dateString) {
+  const d = new Date(dateString);
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  return `${year}-${month}`;
+}
+
+function monthDisplay(monthKey) {
+  const [year, month] = monthKey.split("-");
+  const d = new Date(Number(year), Number(month) - 1, 1);
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    year: "numeric",
+  }).format(d);
+}
+
+function currentMonthKey() {
+  return monthKeyFromDateString(today());
+}
+
+function formatCategoryName(raw) {
+  return String(raw || "OTHER")
+    .toLowerCase()
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function normalizeMerchant(tx) {
+  return String(tx.merchant_name || tx.name || "Unknown").trim();
+}
+
+function rawCategory(tx) {
+  return (
+    tx.category_primary ||
+    tx.personal_finance_category?.primary ||
+    "OTHER"
+  );
+}
+
+function formattedCategory(tx) {
+  return formatCategoryName(rawCategory(tx));
+}
+
+function isDebitLikeTransaction(tx) {
+  return typeof tx.amount === "number" && tx.amount > 0;
+}
+
+function isPendingTransaction(tx) {
+  return tx.pending === true || tx.status === "pending";
+}
+
+function isFixedCategory(raw) {
+  return FIXED_CATEGORIES.has(String(raw || "").toUpperCase());
+}
+
+function isEssentialCategory(raw) {
+  return ESSENTIAL_CATEGORIES.has(String(raw || "").toUpperCase());
+}
+
+function percentChange(current, previous) {
+  if (!previous && !current) return 0;
+  if (!previous) return 100;
+  return Number((((current - previous) / previous) * 100).toFixed(1));
+}
+
+function safePercent(part, total) {
+  if (!total || total <= 0) return 0;
+  return Number(((part / total) * 100).toFixed(1));
+}
+
+function topEntries(obj, limit = 5) {
+  return Object.entries(obj)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([name, amount]) => ({
+      name,
+      amount: Number(amount.toFixed(2)),
+    }));
+}
+
+function sumByCategory(transactions) {
+  const totals = {};
+  for (const tx of transactions) {
+    const key = formattedCategory(tx);
+    totals[key] = (totals[key] || 0) + Number(tx.amount || 0);
+  }
+  return totals;
+}
+
+function sumByMerchant(transactions) {
+  const totals = {};
+  for (const tx of transactions) {
+    const key = normalizeMerchant(tx);
+    totals[key] = (totals[key] || 0) + Number(tx.amount || 0);
+  }
+  return totals;
+}
+
+function classifyBudgetStatus(percentUsed, remaining, totalBudget) {
+  if (!totalBudget || totalBudget <= 0) return "no_budget";
+  if (remaining < 0 || percentUsed > 100) return "over";
+  if (percentUsed >= 80) return "warning";
+  return "good";
+}
+
+// =========================
+// DB init
+// =========================
 async function initDatabase() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS plaid_items (
@@ -110,16 +348,6 @@ async function initDatabase() {
   `);
 
   await pool.query(`
-    ALTER TABLE plaid_accounts
-    ADD COLUMN IF NOT EXISTS current_balance DOUBLE PRECISION;
-  `);
-
-  await pool.query(`
-    ALTER TABLE plaid_accounts
-    ADD COLUMN IF NOT EXISTS available_balance DOUBLE PRECISION;
-  `);
-
-  await pool.query(`
     CREATE TABLE IF NOT EXISTS plaid_item_sync_state (
       item_id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -148,6 +376,19 @@ async function initDatabase() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS category_budgets (
+      id SERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      month_key TEXT NOT NULL,
+      category_name TEXT NOT NULL,
+      budget_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(user_id, month_key, category_name)
+    );
+  `);
+
+  await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_plaid_transactions_user_date
     ON plaid_transactions (user_id, date DESC);
   `);
@@ -162,1149 +403,7 @@ async function initDatabase() {
     ON plaid_transactions (user_id, item_id);
   `);
 
-    await pool.query(`
-    CREATE TABLE IF NOT EXISTS user_budgets (
-      id SERIAL PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      month_key TEXT NOT NULL,
-      category_name TEXT NOT NULL,
-      budget_amount DOUBLE PRECISION NOT NULL,
-      created_at TIMESTAMP DEFAULT NOW(),
-      updated_at TIMESTAMP DEFAULT NOW(),
-      UNIQUE(user_id, month_key, category_name)
-    );
-  `);
-
   console.log("Database initialized");
-}
-
-// =========================
-// OpenAI
-// =========================
-const openai = process.env.OPENAI_API_KEY
-  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-  : null;
-
-// =========================
-// Request helpers
-// =========================
-function getUserId(req) {
-  return req.header("X-USER-ID") || "tyler_local_user";
-}
-
-async function getTransactionsForUser(userId) {
-  const results = await pool.query(
-    "SELECT * FROM transactions WHERE user_id = $1",
-    [userId]
-  );
-  return results.rows;
-}
-
-function parseHeaderList(req, headerName) {
-  const headerValue = req.header(headerName);
-  if (!headerValue) return null;
-
-  const ids = headerValue
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  return ids.length > 0 ? ids : null;
-}
-
-function getSelectedItemIds(req) {
-  return parseHeaderList(req, "X-SELECTED-ITEM-IDS");
-}
-
-function getSelectedAccountIds(req) {
-  return parseHeaderList(req, "X-SELECTED-ACCOUNT-IDS");
-}
-
-// =========================
-// Date helpers
-// =========================
-function formatDate(date) {
-  return date.toISOString().slice(0, 10);
-}
-
-function getDateRangeLast30Days() {
-  const end = new Date();
-  const start = new Date();
-  start.setDate(end.getDate() - 30);
-
-  return {
-    start: formatDate(start),
-    end: formatDate(end),
-  };
-}
-
-function getPrevious30DayRange() {
-  const end = new Date();
-  end.setDate(end.getDate() - 30);
-
-  const start = new Date(end);
-  start.setDate(start.getDate() - 30);
-
-  return {
-    start: formatDate(start),
-    end: formatDate(end),
-  };
-}
-
-function getDateRangeLastSixMonths() {
-  const end = new Date();
-  const start = new Date();
-  start.setMonth(end.getMonth() - 5);
-  start.setDate(1);
-
-  return {
-    start: formatDate(start),
-    end: formatDate(end),
-  };
-}
-
-function getDateRangeLast7Days() {
-  const end = new Date();
-  const start = new Date();
-  start.setDate(end.getDate() - 7);
-
-  return {
-    start: formatDate(start),
-    end: formatDate(end),
-  };
-}
-
-function getPrevious7DayRange() {
-  const end = new Date();
-  end.setDate(end.getDate() - 7);
-
-  const start = new Date(end);
-  start.setDate(start.getDate() - 7);
-
-  return {
-    start: formatDate(start),
-    end: formatDate(end),
-  };
-}
-
-function getCurrentMonthLabel() {
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(new Date());
-}
-
-// =========================
-// Data helpers
-// =========================
-function isDebitLikeTransaction(tx) {
-  return typeof tx.amount === "number" && tx.amount > 0;
-}
-
-function getCategory(tx) {
-  return (
-    tx.personal_finance_category?.primary ||
-    (Array.isArray(tx.category) && tx.category.length > 0 ? tx.category[0] : null) ||
-    "OTHER"
-  );
-}
-
-function formatCategoryName(raw) {
-  return String(raw)
-    .toLowerCase()
-    .split("_")
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
-}
-
-function normalizeMerchant(tx) {
-  return (tx.merchant_name || tx.name || "Unknown").trim();
-}
-
-function percentChange(current, previous) {
-  if (!previous && !current) return 0;
-  if (!previous) return 100;
-  return Number((((current - previous) / previous) * 100).toFixed(1));
-}
-
-function topEntries(obj, limit = 5) {
-  return Object.entries(obj)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, limit)
-    .map(([name, amount]) => ({
-      name,
-      amount: Number(amount.toFixed(2)),
-    }));
-}
-
-function sumByCategory(transactions) {
-  const totals = {};
-  for (const tx of transactions) {
-    const category = formatCategoryName(getCategory(tx));
-    totals[category] = (totals[category] || 0) + tx.amount;
-  }
-  return totals;
-}
-
-function topFlexibleCategories(categoryTotals, limit = 5) {
-  return Object.entries(categoryTotals)
-    .filter(([name]) => isFlexibleExpenseCategory(name.replace(/\s+/g, "_").toUpperCase()))
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, limit)
-    .map(([name, amount]) => ({
-      name,
-      amount: Number(amount.toFixed(2)),
-    }));
-}
-
-function sumByMerchant(transactions) {
-  const totals = {};
-  for (const tx of transactions) {
-    const merchant = normalizeMerchant(tx);
-    totals[merchant] = (totals[merchant] || 0) + tx.amount;
-  }
-  return totals;
-}
-
-function monthKeyFromDateString(dateString) {
-  const d = new Date(dateString);
-  const year = d.getFullYear();
-  const month = String(d.getMonth() + 1).padStart(2, "0");
-  return `${year}-${month}`;
-}
-
-function monthDisplay(monthKey) {
-  const [year, month] = monthKey.split("-");
-  const date = new Date(Number(year), Number(month) - 1, 1);
-  return new Intl.DateTimeFormat("en-US", {
-    month: "short",
-    year: "numeric",
-  }).format(date);
-}
-
-function safeDateString(value) {
-  if (!value) return null;
-
-  if (typeof value === "string") {
-    return value.slice(0, 10);
-  }
-
-  if (value instanceof Date) {
-    return value.toISOString().slice(0, 10);
-  }
-
-  const parsed = new Date(value);
-  if (!Number.isNaN(parsed.getTime())) {
-    return parsed.toISOString().slice(0, 10);
-  }
-
-  return null;
-}
-
-function buildTransactionsByMonth(transactions, start, end) {
-  const groups = {};
-
-  for (const tx of transactions) {
-    if (!tx.date) continue;
-
-    const key = monthKeyFromDateString(tx.date);
-    if (!groups[key]) groups[key] = [];
-
-    groups[key].push({
-      id: tx.transaction_id,
-      name: tx.name || "Unknown",
-      date: tx.date,
-      amount: Number((tx.amount ?? 0).toFixed(2)),
-      category: formatCategoryName(getCategory(tx)),
-      institutionName: tx._institution_name || null,
-      accountName: tx._account_name || null,
-      accountMask: tx._account_mask || null,
-      item_id: tx._item_id || null,
-      account_id: tx.account_id || null,
-      pending: !!tx.pending,
-      status: tx.pending ? "pending" : "posted",
-    });
-  }
-
-  const months = Object.entries(groups)
-    .map(([month, txs]) => ({
-      month,
-      totalSpent: Number(txs.reduce((sum, t) => sum + t.amount, 0).toFixed(2)),
-      count: txs.length,
-      pendingCount: txs.filter((t) => t.pending).length,
-      postedCount: txs.filter((t) => !t.pending).length,
-      transactions: txs.sort((a, b) => {
-        if (b.date !== a.date) return b.date.localeCompare(a.date);
-        return Number(a.pending) - Number(b.pending);
-      }),
-    }))
-    .sort((a, b) => b.month.localeCompare(a.month));
-
-  return {
-    range: {
-      start_date: start,
-      end_date: end,
-    },
-    months,
-  };
-}
-
-function buildMonthlyTrend(transactions) {
-  const grouped = {};
-
-  for (const tx of transactions) {
-    const key = monthKeyFromDateString(tx.date);
-    grouped[key] = (grouped[key] || 0) + tx.amount;
-  }
-
-  return Object.entries(grouped)
-    .sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([month, totalSpent]) => ({
-      month,
-      label: monthDisplay(month),
-      totalSpent: Number(totalSpent.toFixed(2)),
-    }));
-}
-
-function buildCategoryChartData(transactions) {
-  const totals = sumByCategory(transactions);
-  const items = topEntries(totals, 8);
-  const grandTotal = items.reduce((sum, item) => sum + item.amount, 0);
-
-  return items.map((item) => ({
-    category: item.name,
-    amount: item.amount,
-    percentage: grandTotal > 0 ? Number(((item.amount / grandTotal) * 100).toFixed(1)) : 0,
-  }));
-}
-
-function findRecurringCharges(transactions) {
-  const grouped = {};
-
-  for (const tx of transactions) {
-    const merchant = normalizeMerchant(tx);
-    if (!grouped[merchant]) grouped[merchant] = [];
-    grouped[merchant].push(tx);
-  }
-
-  const recurring = [];
-
-  for (const [merchant, txs] of Object.entries(grouped)) {
-    if (txs.length < 2) continue;
-
-    const total = txs.reduce((sum, t) => sum + t.amount, 0);
-    recurring.push({
-      merchant,
-      count: txs.length,
-      total: Number(total.toFixed(2)),
-      average: Number((total / txs.length).toFixed(2)),
-    });
-  }
-
-  return recurring.sort((a, b) => b.total - a.total).slice(0, 10);
-}
-
-function normalizeCategoryKey(raw) {
-  return String(raw || "").toUpperCase().trim();
-}
-
-function isFixedExpenseCategory(rawCategory) {
-  const category = normalizeCategoryKey(rawCategory);
-
-  return [
-    "LOAN_PAYMENTS",
-    "RENT_AND_UTILITIES",
-    "RENT",
-    "MORTGAGE",
-    "INSURANCE",
-    "TAXES",
-    "DEBT_PAYMENTS",
-    "TRANSFER_OUT"
-  ].includes(category);
-}
-
-function isFlexibleExpenseCategory(rawCategory) {
-  return !isFixedExpenseCategory(rawCategory);
-}
-
-// =========================
-// Insights engine
-// =========================
-function recurringFrequencyLabel(count, firstDate, lastDate) {
-  if (!firstDate || !lastDate || count < 2) return "Recurring";
-
-  const first = new Date(firstDate);
-  const last = new Date(lastDate);
-  const diffMs = Math.abs(last - first);
-  const diffDays = Math.max(1, Math.round(diffMs / (1000 * 60 * 60 * 24)));
-  const averageGap = diffDays / Math.max(1, count - 1);
-
-  if (averageGap <= 10) return "Weekly";
-  if (averageGap <= 20) return "Biweekly";
-  if (averageGap <= 40) return "Monthly";
-  if (averageGap <= 75) return "Every 2 months";
-  return "Recurring";
-}
-
-function nextExpectedChargeDate(lastDate, frequencyLabel) {
-  if (!lastDate) return null;
-
-  const d = new Date(lastDate);
-
-  switch (frequencyLabel) {
-    case "Weekly":
-      d.setDate(d.getDate() + 7);
-      break;
-    case "Biweekly":
-      d.setDate(d.getDate() + 14);
-      break;
-    case "Monthly":
-      d.setMonth(d.getMonth() + 1);
-      break;
-    case "Every 2 months":
-      d.setMonth(d.getMonth() + 2);
-      break;
-    default:
-      d.setMonth(d.getMonth() + 1);
-      break;
-  }
-
-  return d.toISOString().slice(0, 10);
-}
-
-function isSubscriptionLikeCategory(rawCategory) {
-  const category = normalizeCategoryKey(rawCategory);
-
-  return [
-    "ENTERTAINMENT",
-    "GENERAL_SERVICES",
-    "PERSONAL_CARE",
-    "GENERAL_MERCHANDISE",
-    "FOOD_AND_DRINK",
-    "TRANSPORTATION",
-    "TELECOMMUNICATIONS",
-    "STREAMING",
-    "SUBSCRIPTIONS",
-  ].includes(category);
-}
-
-function buildSubscriptionInsights(transactions) {
-  const merchantGroups = {};
-
-  for (const tx of transactions) {
-    const merchant = normalizeMerchant(tx);
-    if (!merchant || merchant.toLowerCase() === "unknown") continue;
-    if (tx.pending) continue;
-    if (typeof tx.amount !== "number" || tx.amount <= 0) continue;
-
-    const normalizedCategory = normalizeCategoryKey(getCategory(tx));
-    if (!isSubscriptionLikeCategory(normalizedCategory)) continue;
-
-    if (!merchantGroups[merchant]) {
-      merchantGroups[merchant] = [];
-    }
-
-    merchantGroups[merchant].push(tx);
-  }
-
-  const subscriptions = [];
-
-  for (const [merchant, txs] of Object.entries(merchantGroups)) {
-    if (txs.length < 2) continue;
-
-    const sorted = [...txs].sort((a, b) => String(a.date).localeCompare(String(b.date)));
-    const firstDate = sorted[0]?.date || null;
-    const lastDate = sorted[sorted.length - 1]?.date || null;
-    const count = sorted.length;
-    const total = sorted.reduce((sum, tx) => sum + tx.amount, 0);
-    const average = total / count;
-    const frequency = recurringFrequencyLabel(count, firstDate, lastDate);
-
-    const amountVarianceOk = sorted.every((tx) => Math.abs(tx.amount - average) <= Math.max(5, average * 0.35));
-
-    if (!amountVarianceOk) continue;
-
-    subscriptions.push({
-      merchant,
-      count,
-      total: Number(total.toFixed(2)),
-      average: Number(average.toFixed(2)),
-      frequency,
-      firstDate,
-      lastDate,
-      nextExpectedDate: nextExpectedChargeDate(lastDate, frequency),
-      category: formatCategoryName(getCategory(sorted[sorted.length - 1])),
-    });
-  }
-
-  const filtered = subscriptions
-    .filter((s) => s.frequency === "Monthly" || s.frequency === "Biweekly" || s.frequency === "Weekly")
-    .sort((a, b) => b.average - a.average);
-
-  const estimatedMonthlyTotal = filtered.reduce((sum, sub) => {
-    if (sub.frequency === "Weekly") return sum + sub.average * 4;
-    if (sub.frequency === "Biweekly") return sum + sub.average * 2;
-    return sum + sub.average;
-  }, 0);
-
-  return {
-    subscriptions: filtered.slice(0, 12),
-    totalMonthlySubscriptionSpend: Number(estimatedMonthlyTotal.toFixed(2)),
-  };
-}
-
-function buildFixedVsFlexible(categoryTotals) {
-  let fixed = 0;
-  let flexible = 0;
-
-  for (const [categoryName, amount] of Object.entries(categoryTotals)) {
-    const normalized = String(categoryName).replace(/\s+/g, "_").toUpperCase();
-
-    if (isFixedExpenseCategory(normalized)) {
-      fixed += amount;
-    } else {
-      flexible += amount;
-    }
-  }
-
-  const total = fixed + flexible;
-
-  return {
-    fixed: Number(fixed.toFixed(2)),
-    flexible: Number(flexible.toFixed(2)),
-    fixedPercent: total > 0 ? Number(((fixed / total) * 100).toFixed(1)) : 0,
-    flexiblePercent: total > 0 ? Number(((flexible / total) * 100).toFixed(1)) : 0,
-  };
-}
-
-function isEssentialCategory(rawCategory) {
-  const category = normalizeCategoryKey(rawCategory);
-
-  return [
-    "FOOD_AND_DRINK",
-    "TRANSPORTATION",
-    "LOAN_PAYMENTS",
-    "RENT_AND_UTILITIES",
-    "RENT",
-    "MORTGAGE",
-    "INSURANCE",
-    "HEALTHCARE",
-    "PERSONAL_CARE",
-    "GENERAL_SERVICES",
-    "TAXES",
-    "DEBT_PAYMENTS",
-  ].includes(category);
-}
-
-function buildEssentialVsNonEssential(categoryTotals) {
-  let essential = 0;
-  let nonEssential = 0;
-
-  for (const [categoryName, amount] of Object.entries(categoryTotals)) {
-    const normalized = String(categoryName).replace(/\s+/g, "_").toUpperCase();
-
-    if (isEssentialCategory(normalized)) {
-      essential += amount;
-    } else {
-      nonEssential += amount;
-    }
-  }
-
-  const total = essential + nonEssential;
-
-  return {
-    essential: Number(essential.toFixed(2)),
-    nonEssential: Number(nonEssential.toFixed(2)),
-    essentialPercent: total > 0 ? Number(((essential / total) * 100).toFixed(1)) : 0,
-    nonEssentialPercent: total > 0 ? Number(((nonEssential / total) * 100).toFixed(1)) : 0,
-  };
-}
-
-function buildSmartSavingsTips(topFlexibleCategories, subscriptionInsights) {
-  const tips = [];
-
-  if (topFlexibleCategories[0]) {
-    const amount = topFlexibleCategories[0].amount * 0.1;
-    tips.push({
-      title: `Trim ${topFlexibleCategories[0].name}`,
-      message: `Cutting 10% from ${topFlexibleCategories[0].name} could save about $${amount.toFixed(2)}.`,
-      estimatedSavings: Number(amount.toFixed(2)),
-    });
-  }
-
-  if (subscriptionInsights.subscriptions[0]) {
-    const sub = subscriptionInsights.subscriptions[0];
-    tips.push({
-      title: `Review ${sub.merchant}`,
-      message: `${sub.merchant} looks like a ${sub.frequency.toLowerCase()} recurring charge averaging $${sub.average.toFixed(2)}.`,
-      estimatedSavings: sub.frequency === "Weekly"
-        ? Number((sub.average * 4).toFixed(2))
-        : sub.frequency === "Biweekly"
-        ? Number((sub.average * 2).toFixed(2))
-        : Number(sub.average.toFixed(2)),
-    });
-  }
-
-  if (subscriptionInsights.totalMonthlySubscriptionSpend > 0) {
-    tips.push({
-      title: "Lower subscription load",
-      message: `Your estimated monthly subscription spend is $${subscriptionInsights.totalMonthlySubscriptionSpend.toFixed(2)}.`,
-      estimatedSavings: Number((subscriptionInsights.totalMonthlySubscriptionSpend * 0.25).toFixed(2)),
-    });
-  }
-
-  return tips.slice(0, 4);
-}
-
-function buildBudgetScore(currentSpent, previousSpent, recurringCharges, topCategoryAmount) {
-  let score = 100;
-
-  if (currentSpent > previousSpent) {
-    score -= Math.min(20, Math.round((currentSpent - previousSpent) / 10));
-  }
-
-  if (recurringCharges.length >= 3) {
-    score -= 10;
-  }
-
-  if (currentSpent > 0 && topCategoryAmount > currentSpent * 0.5) {
-    score -= 10;
-  }
-
-  return Math.max(35, Math.min(100, score));
-}
-
-function buildSavingsOpportunities(topCategories, recurringCharges, flexibleCategories = []) {
-  const opportunities = [];
-
-  const topFlexible = flexibleCategories[0];
-
-  if (topFlexible) {
-    opportunities.push({
-      title: `Reduce ${topFlexible.name}`,
-      amount: Number((topFlexible.amount * 0.15).toFixed(2)),
-      message: `Cutting 15% from ${topFlexible.name} could save about $${(
-        topFlexible.amount * 0.15
-      ).toFixed(2)}.`,
-    });
-  }
-
-  if (recurringCharges[0]) {
-    opportunities.push({
-      title: `Review ${recurringCharges[0].merchant}`,
-      amount: recurringCharges[0].average,
-      message: `${recurringCharges[0].merchant} appears recurring. Reviewing it could save about $${recurringCharges[0].average.toFixed(
-        2
-      )} per cycle.`,
-    });
-  }
-
-  if (opportunities.length === 0 && topCategories[0]) {
-    opportunities.push({
-      title: `Review overall spending`,
-      amount: 0,
-      message: `${topCategories[0].name} is one of your largest expenses, but it may be a fixed obligation. Focus on flexible categories and recurring charges first.`,
-    });
-  }
-
-  return opportunities.slice(0, 3);
-}
-
-function buildActionItems(currentSpent, previousSpent, topCategories, recurringCharges, flexibleCategories = []) {
-  const items = [];
-
-  if (currentSpent > previousSpent) {
-    items.push("Your spending is up from the previous period. Review your largest flexible category first.");
-  }
-
-  if (flexibleCategories[0]) {
-    items.push(`Your biggest flexible category is ${flexibleCategories[0].name}. That is the fastest place to cut.`);
-  } else if (topCategories[0]) {
-    items.push(`Your largest category is ${topCategories[0].name}, but it may be a fixed expense. Focus on flexible spending first.`);
-  }
-
-  if (recurringCharges.length > 0) {
-    items.push(`You have ${recurringCharges.length} recurring charge pattern(s). Review subscriptions and repeated services.`);
-  }
-
-  if (items.length === 0) {
-    items.push("Your spending is stable. Keep tracking your flexible categories to stay on target.");
-  }
-
-  return items.slice(0, 4);
-}
-
-function buildRiskFlags(currentSpent, previousSpent, topCategories, recurringCharges) {
-  const flags = [];
-
-  if (currentSpent > previousSpent * 1.2 && previousSpent > 0) {
-    flags.push("Spending increased sharply versus the prior 30 days.");
-  }
-
-  if (topCategories[0] && currentSpent > 0 && topCategories[0].amount > currentSpent * 0.5) {
-    flags.push(`More than half of your spending is concentrated in ${topCategories[0].name}.`);
-  }
-
-  if (recurringCharges.length >= 3) {
-    flags.push("Several recurring charges were detected.");
-  }
-
-  return flags;
-}
-
-function buildActionableMessages(currentTransactions, previousTransactions) {
-  const currentSpent = currentTransactions.reduce((sum, t) => sum + t.amount, 0);
-  const previousSpent = previousTransactions.reduce((sum, t) => sum + t.amount, 0);
-  const currentCategories = sumByCategory(currentTransactions);
-  const previousCategories = sumByCategory(previousTransactions);
-  const currentMerchants = sumByMerchant(currentTransactions);
-
-  const messages = [];
-
-  const topCategory = topEntries(currentCategories, 1)[0];
-const topFlexibleCategory = topFlexibleCategories(currentCategories, 1)[0];
-
-if (topCategory) {
-  const normalizedTopCategory = String(topCategory.name).replace(/\s+/g, "_").toUpperCase();
-  const isFixed = isFixedExpenseCategory(normalizedTopCategory);
-
-  messages.push({
-    title: `${topCategory.name} is your biggest category`,
-    message: isFixed
-      ? `You spent $${topCategory.amount.toFixed(2)} on ${topCategory.name}. This appears to be a fixed obligation, so look for savings in flexible categories instead.`
-      : `You spent $${topCategory.amount.toFixed(2)} on ${topCategory.name}. This is the fastest category to target if you want quick savings.`,
-    impact: "high",
-    suggestedAction: isFixed
-      ? topFlexibleCategory
-        ? `Focus on reducing ${topFlexibleCategory.name} instead of fixed payments.`
-        : `Review flexible spending and recurring charges instead of fixed payments.`
-      : `Try cutting ${topCategory.name} by 10–15% this month.`,
-  });
-}
-
-  const topMerchant = topEntries(currentMerchants, 1)[0];
-  if (topMerchant) {
-    messages.push({
-      title: `${topMerchant.name} is your top merchant`,
-      message: `Your highest merchant spend was $${topMerchant.amount.toFixed(2)} with ${topMerchant.name}.`,
-      impact: "medium",
-      suggestedAction: `Review whether that merchant reflects a habit you want to change.`,
-    });
-  }
-
-  if (currentSpent > previousSpent) {
-    const increase = currentSpent - previousSpent;
-    messages.push({
-      title: "Your spending increased",
-      message: `You spent $${increase.toFixed(2)} more than the previous 30-day period.`,
-      impact: "high",
-      suggestedAction: "Check the category and merchant sections to see what changed.",
-    });
-  }
-
-  for (const [category, amount] of Object.entries(currentCategories)) {
-    const prev = previousCategories[category] || 0;
-    const change = percentChange(amount, prev);
-
-    if (amount >= 50 && change >= 25) {
-      messages.push({
-        title: `${category} is rising`,
-        message: `You spent $${amount.toFixed(2)} on ${category}, up ${change}% from the prior period.`,
-        impact: "medium",
-        suggestedAction: `Watch your ${category} spending over the next 2 weeks.`,
-      });
-    }
-  }
-
-  return messages.slice(0, 5);
-}
-
-function buildRuleInsights(currentTransactions, previousTransactions) {
-  const currentSpent = currentTransactions.reduce((sum, t) => sum + t.amount, 0);
-  const previousSpent = previousTransactions.reduce((sum, t) => sum + t.amount, 0);
-
-  const currentCategories = sumByCategory(currentTransactions);
-  const previousCategories = sumByCategory(previousTransactions);
-  const currentMerchants = sumByMerchant(currentTransactions);
-  const recurring = findRecurringCharges(currentTransactions);
-
-  const topCategory = topEntries(currentCategories, 1)[0] || null;
-  const topMerchant = topEntries(currentMerchants, 1)[0] || null;
-
-  const insights = [];
-
-  if (topCategory) {
-    insights.push({
-      type: "top_category",
-      title: `Top spending category: ${topCategory.name}`,
-      message: `${topCategory.name} was your biggest category at $${topCategory.amount.toFixed(2)} in the last 30 days.`,
-      priority: "high",
-    });
-  }
-
-  if (topMerchant) {
-    insights.push({
-      type: "top_merchant",
-      title: `Biggest merchant: ${topMerchant.name}`,
-      message: `Your highest spend with a single merchant was ${topMerchant.name} at $${topMerchant.amount.toFixed(2)}.`,
-      priority: "medium",
-    });
-  }
-
-  const overallChange = percentChange(currentSpent, previousSpent);
-  if (currentSpent > previousSpent) {
-    insights.push({
-      type: "spending_up",
-      title: "Spending increased",
-      message: `You spent $${currentSpent.toFixed(2)} in the last 30 days, up ${overallChange}% from the previous period.`,
-      priority: "high",
-    });
-  } else if (currentSpent < previousSpent) {
-    insights.push({
-      type: "spending_down",
-      title: "Spending decreased",
-      message: `You spent $${currentSpent.toFixed(2)} in the last 30 days, down ${Math.abs(overallChange)}% from the previous period.`,
-      priority: "good",
-    });
-  }
-
-  for (const [category, amount] of Object.entries(currentCategories)) {
-    const prev = previousCategories[category] || 0;
-    const change = percentChange(amount, prev);
-
-    if (amount >= 50 && change >= 30) {
-      insights.push({
-        type: "category_jump",
-        title: `${category} is trending up`,
-        message: `You spent $${amount.toFixed(2)} on ${category}, which is up ${change}% from the prior 30 days.`,
-        priority: "medium",
-      });
-    }
-  }
-
-  if (recurring.length > 0) {
-    const topRecurring = recurring[0];
-    insights.push({
-      type: "recurring",
-      title: "Recurring charges detected",
-      message: `You have recurring spending with ${topRecurring.merchant}. It appeared ${topRecurring.count} times and totaled $${topRecurring.total.toFixed(2)}.`,
-      priority: "medium",
-    });
-  }
-
-  if (topCategory && currentSpent > 0 && topCategory.amount >= currentSpent * 0.45) {
-    insights.push({
-      type: "concentration",
-      title: "Spending is concentrated",
-      message: `Nearly half of your spending came from ${topCategory.name}. Reducing that category would have the biggest impact.`,
-      priority: "high",
-    });
-  }
-
-  return insights.slice(0, 6);
-}
-
-function buildMoneyInsights(currentTransactions, previousTransactions, sixMonthTransactions) {
-  const currentSpent = currentTransactions.reduce((sum, t) => sum + t.amount, 0);
-  const previousSpent = previousTransactions.reduce((sum, t) => sum + t.amount, 0);
-
-  const categoryTotals = sumByCategory(currentTransactions);
-  const merchantTotals = sumByMerchant(currentTransactions);
-  const recurringCharges = findRecurringCharges(currentTransactions);
-  const insights = buildRuleInsights(currentTransactions, previousTransactions);
-  const topCategories = topEntries(categoryTotals, 5);
-  const flexibleCategories = topFlexibleCategories(categoryTotals, 5);
-  const topMerchants = topEntries(merchantTotals, 5);
-
-  const topCategoryAmount = topCategories[0]?.amount || 0;
-  const budgetScore = buildBudgetScore(
-    currentSpent,
-    previousSpent,
-    recurringCharges,
-    topCategoryAmount
-  );
-
-  const subscriptionInsights = buildSubscriptionInsights(currentTransactions);
-  const fixedVsFlexible = buildFixedVsFlexible(categoryTotals);
-  const essentialVsNonEssential = buildEssentialVsNonEssential(categoryTotals);
-  const smartSavingsTips = buildSmartSavingsTips(flexibleCategories, subscriptionInsights);
-
-  return {
-    summary: {
-      currentSpent: Number(currentSpent.toFixed(2)),
-      previousSpent: Number(previousSpent.toFixed(2)),
-      changePercent: percentChange(currentSpent, previousSpent),
-      transactionCount: currentTransactions.length,
-    },
-    budgetScore,
-    topCategories,
-    topMerchants,
-    recurringCharges,
-    insights,
-    actionableMessages: buildActionableMessages(currentTransactions, previousTransactions),
-    savingsOpportunities: buildSavingsOpportunities(topCategories, recurringCharges, flexibleCategories),
-    actionItems: buildActionItems(
-      currentSpent,
-      previousSpent,
-      topCategories,
-      recurringCharges,
-      flexibleCategories
-    ),
-    riskFlags: buildRiskFlags(
-      currentSpent,
-      previousSpent,
-      topCategories,
-      recurringCharges
-    ),
-    monthlyTrend: buildMonthlyTrend(sixMonthTransactions),
-    categoryChart: buildCategoryChartData(currentTransactions),
-    fixedVsFlexible,
-    essentialVsNonEssential,
-    subscriptionInsights,
-    smartSavingsTips,
-  };
-}
-
-function buildRichAlerts(currentTransactions, previousTransactions) {
-  const alerts = [];
-
-  const currentSpent = currentTransactions.reduce((sum, tx) => sum + tx.amount, 0);
-  const previousSpent = previousTransactions.reduce((sum, tx) => sum + tx.amount, 0);
-  const recurringCharges = findRecurringCharges(currentTransactions);
-
-  const change = percentChange(currentSpent, previousSpent);
-
-  if (currentSpent > previousSpent && currentSpent > 0) {
-    alerts.push({
-      type: "SPENDING_SPIKE",
-      title: "Spending spike detected",
-      message: `You spent $${currentSpent.toFixed(2)} in the last 30 days, up ${change}% from the previous period.`,
-      severity: change >= 25 ? "high" : "medium",
-    });
-  }
-
-  if (recurringCharges.length > 0) {
-    alerts.push({
-      type: "RECURRING_CHARGES",
-      title: "Recurring charges detected",
-      message: `${recurringCharges.length} recurring charge pattern(s) were found in your recent transactions.`,
-      severity: recurringCharges.length >= 3 ? "medium" : "low",
-    });
-  }
-
-  const topCategories = topEntries(sumByCategory(currentTransactions), 1);
-  if (topCategories[0] && currentSpent > 0 && topCategories[0].amount > currentSpent * 0.5) {
-    alerts.push({
-      type: "CATEGORY_CONCENTRATION",
-      title: "One category dominates your spending",
-      message: `${topCategories[0].name} makes up most of your recent spending.`,
-      severity: "medium",
-    });
-  }
-
-  return alerts;
-}
-
-function buildWeeklySummary(currentWeekTransactions, previousWeekTransactions) {
-  const currentSpent = currentWeekTransactions.reduce((sum, tx) => sum + tx.amount, 0);
-  const previousSpent = previousWeekTransactions.reduce((sum, tx) => sum + tx.amount, 0);
-  const topCategories = topEntries(sumByCategory(currentWeekTransactions), 3);
-  const topMerchants = topEntries(sumByMerchant(currentWeekTransactions), 3);
-  const recurringCharges = findRecurringCharges(currentWeekTransactions);
-  const changePercentValue = percentChange(currentSpent, previousSpent);
-
-  const highlights = [];
-
-  if (currentSpent > previousSpent) {
-    highlights.push(`You spent more this week than last week by ${changePercentValue}%.`);
-  } else if (currentSpent < previousSpent) {
-    highlights.push(`You spent less this week than last week by ${Math.abs(changePercentValue)}%.`);
-  } else {
-    highlights.push("Your weekly spending was flat compared with last week.");
-  }
-
-  if (topCategories[0]) {
-    highlights.push(`Your top category this week was ${topCategories[0].name} at $${topCategories[0].amount.toFixed(2)}.`);
-  }
-
-  if (topMerchants[0]) {
-    highlights.push(`Your top merchant this week was ${topMerchants[0].name} at $${topMerchants[0].amount.toFixed(2)}.`);
-  }
-
-  const recommendations = [];
-
-  if (topCategories[0]) {
-    recommendations.push(`Watch ${topCategories[0].name} next week since it was your largest category.`);
-  }
-
-  if (recurringCharges.length > 0) {
-    recommendations.push(`Review recurring charges like ${recurringCharges[0].merchant} for easy savings opportunities.`);
-  }
-
-  if (currentSpent > previousSpent) {
-    recommendations.push("Try to reduce one non-essential category next week to reverse the spending increase.");
-  }
-
-  if (recommendations.length === 0) {
-    recommendations.push("Your spending looks steady. Keep following your current pattern.");
-  }
-
-  return {
-    summary: {
-      currentSpent: Number(currentSpent.toFixed(2)),
-      previousSpent: Number(previousSpent.toFixed(2)),
-      changePercent: changePercentValue,
-      transactionCount: currentWeekTransactions.length,
-    },
-    highlights,
-    recommendations: recommendations.slice(0, 3),
-    topCategories,
-    topMerchants,
-  };
-}
-
-// =========================
-// AI response helper
-// =========================
-function buildBudgetAIResponse(question, moneyInsights) {
-  const q = question.toLowerCase();
-
-  const topCategory = moneyInsights.topCategories[0];
-  const topMerchant = moneyInsights.topMerchants[0];
-  const recurring = moneyInsights.recurringCharges[0];
-  const currentSpent = moneyInsights.summary.currentSpent;
-  const previousSpent = moneyInsights.summary.previousSpent;
-  const changePercent = moneyInsights.summary.changePercent;
-
-  let answer = "";
-  let suggestions = [];
-  let score = moneyInsights.budgetScore || 70;
-
-  if (q.includes("wasting") || q.includes("waste")) {
-    answer = topCategory
-      ? `Your biggest spending pressure is **${topCategory.name}** at **$${topCategory.amount.toFixed(2)}**. ${
-          recurring
-            ? `You also have recurring spending with **${recurring.merchant}** totaling **$${recurring.total.toFixed(2)}**. `
-            : ""
-        }The easiest place to cut first is your largest category.`
-      : "I don't have enough spending data yet to identify waste areas.";
-
-    suggestions = [
-      "What should I cut first?",
-      "Show my recurring charges",
-      "How much could I save this month?"
-    ];
-  } else if (q.includes("save") || q.includes("saving")) {
-  const topCategory = moneyInsights.topCategories[0];
-  const normalizedTopCategory = topCategory
-    ? String(topCategory.name).replace(/\s+/g, "_").toUpperCase()
-    : "";
-
-  const topCategoryIsFixed = topCategory
-    ? isFixedExpenseCategory(normalizedTopCategory)
-    : false;
-
-  if (moneyInsights.savingsOpportunities.length > 0) {
-    const topOpportunity = moneyInsights.savingsOpportunities[0];
-
-    answer = topCategoryIsFixed
-      ? `Your largest expense looks like a fixed obligation (**${topCategory.name}**), so the best near-term savings move is **${topOpportunity.title}**. ${topOpportunity.message}`
-      : `Your best near-term savings move is **${topOpportunity.title}**. ${topOpportunity.message}`;
-  } else {
-    answer = "I don't have a strong savings recommendation yet. Focus on flexible spending and recurring charges first.";
-  }
-
-    suggestions = [
-      "What category is hurting me most?",
-      "Show my biggest merchant",
-      "Did my spending increase?"
-    ];
-  } else if (q.includes("biggest expense") || q.includes("top category")) {
-    answer = topCategory
-      ? `Your top spending category is **${topCategory.name}** at **$${topCategory.amount.toFixed(2)}** in the last 30 days.`
-      : "I don't have enough data yet to find your biggest expense.";
-
-    suggestions = [
-      "Where am I wasting money?",
-      "What should I cut first?",
-      "Show my top merchants"
-    ];
-  } else if (q.includes("merchant")) {
-    answer = topMerchant
-      ? `Your biggest merchant spend was **${topMerchant.name}** at **$${topMerchant.amount.toFixed(2)}**.`
-      : "I don't have enough merchant data yet.";
-
-    suggestions = [
-      "What did I spend the most on?",
-      "Show recurring charges",
-      "Did I spend more than last month?"
-    ];
-  } else if (q.includes("subscription") || q.includes("recurring")) {
-    if (moneyInsights.recurringCharges.length === 0) {
-      answer = "I did not detect recurring charges in the last 30 days.";
-    } else {
-      const lines = moneyInsights.recurringCharges
-        .slice(0, 3)
-        .map(
-          (r) =>
-            `- **${r.merchant}**: ${r.count} charges totaling **$${r.total.toFixed(2)}**`
-        )
-        .join("\n");
-
-      answer = `Here are your top recurring charges:\n${lines}`;
-    }
-
-    suggestions = [
-      "Which recurring charge is biggest?",
-      "How much could I save?",
-      "Where am I wasting money?"
-    ];
-  } else if (
-    q.includes("more than last month") ||
-    q.includes("spend more") ||
-    q.includes("last month")
-  ) {
-    answer =
-      currentSpent > previousSpent
-        ? `Yes — you spent **$${currentSpent.toFixed(2)}** in the last 30 days versus **$${previousSpent.toFixed(2)}** in the previous period, which is **up ${changePercent}%**.`
-        : `No — you spent **$${currentSpent.toFixed(2)}** in the last 30 days versus **$${previousSpent.toFixed(2)}** in the previous period, which is **down ${Math.abs(changePercent)}%**.`;
-
-    suggestions = [
-      "What category increased the most?",
-      "Where am I wasting money?",
-      "What should I cut first?"
-    ];
-  } else if (q.includes("budget score") || q.includes("score")) {
-    answer = `Your current **Budget Score** is **${moneyInsights.budgetScore}/100**. ${
-      moneyInsights.riskFlags.length > 0
-        ? `The biggest issues are: ${moneyInsights.riskFlags.join(" ")}`
-        : "Your spending pattern looks fairly stable right now."
-    }`;
-
-    suggestions = [
-      "How can I improve my score?",
-      "What should I cut first?",
-      "Show my savings opportunities"
-    ];
-  } else {
-    const insightLines = moneyInsights.insights
-      .slice(0, 3)
-      .map((i) => `- ${i.message}`)
-      .join("\n");
-
-    answer = `Here’s your current money snapshot:\n${insightLines}`;
-    suggestions = [
-      "Where am I wasting money?",
-      "What did I spend the most on?",
-      "How much could I save?"
-    ];
-  }
-
-  return {
-    answer,
-    suggestions,
-    score,
-  };
 }
 
 // =========================
@@ -1338,17 +437,12 @@ async function getUserItems(userId) {
     `,
     [userId]
   );
-
   return result.rows;
 }
 
 async function getUserItemsFiltered(userId, selectedItemIds = null) {
   const allItems = await getUserItems(userId);
-
-  if (!selectedItemIds || selectedItemIds.length === 0) {
-    return allItems;
-  }
-
+  if (!selectedItemIds || selectedItemIds.length === 0) return allItems;
   return allItems.filter((item) => selectedItemIds.includes(item.item_id));
 }
 
@@ -1362,39 +456,18 @@ async function getUserItemByItemId(userId, itemId) {
     `,
     [userId, itemId]
   );
-
   return result.rows[0] || null;
 }
 
 async function deleteUserItem(userId, itemId) {
-  await pool.query(
-    `DELETE FROM plaid_items WHERE user_id = $1 AND item_id = $2`,
-    [userId, itemId]
-  );
-
-  await pool.query(
-    `DELETE FROM plaid_accounts WHERE user_id = $1 AND item_id = $2`,
-    [userId, itemId]
-  );
-
-  await pool.query(
-    `DELETE FROM plaid_item_sync_state WHERE user_id = $1 AND item_id = $2`,
-    [userId, itemId]
-  );
-
-  await pool.query(
-    `DELETE FROM plaid_transactions WHERE user_id = $1 AND item_id = $2`,
-    [userId, itemId]
-  );
+  await pool.query(`DELETE FROM plaid_items WHERE user_id = $1 AND item_id = $2`, [userId, itemId]);
+  await pool.query(`DELETE FROM plaid_accounts WHERE user_id = $1 AND item_id = $2`, [userId, itemId]);
+  await pool.query(`DELETE FROM plaid_transactions WHERE user_id = $1 AND item_id = $2`, [userId, itemId]);
+  await pool.query(`DELETE FROM plaid_item_sync_state WHERE user_id = $1 AND item_id = $2`, [userId, itemId]);
 }
 
 async function replaceAccountsForItem(userId, itemId, institutionName, accounts) {
-  await pool.query(
-    `
-    DELETE FROM plaid_accounts WHERE user_id = $1 AND item_id = $2
-    `,
-    [userId, itemId]
-  );
+  await pool.query(`DELETE FROM plaid_accounts WHERE user_id = $1 AND item_id = $2`, [userId, itemId]);
 
   for (const account of accounts) {
     await pool.query(
@@ -1445,56 +518,7 @@ async function replaceAccountsForItem(userId, itemId, institutionName, accounts)
 }
 
 async function getAccountsForUser(userId, selectedItemIds = null, selectedAccountIds = null) {
-  if (selectedAccountIds && selectedAccountIds.length > 0) {
-    const result = await pool.query(
-      `
-      SELECT
-        account_id,
-        user_id,
-        item_id,
-        institution_name,
-        name,
-        official_name,
-        mask,
-        type,
-        subtype,
-        current_balance,
-        available_balance
-      FROM plaid_accounts
-      WHERE user_id = $1 AND account_id = ANY($2::text[])
-      ORDER BY institution_name ASC, name ASC
-      `,
-      [userId, selectedAccountIds]
-    );
-    return result.rows;
-  }
-
-  if (selectedItemIds && selectedItemIds.length > 0) {
-    const result = await pool.query(
-      `
-      SELECT
-        account_id,
-        user_id,
-        item_id,
-        institution_name,
-        name,
-        official_name,
-        mask,
-        type,
-        subtype,
-        current_balance,
-        available_balance
-      FROM plaid_accounts
-      WHERE user_id = $1 AND item_id = ANY($2::text[])
-      ORDER BY institution_name ASC, name ASC
-      `,
-      [userId, selectedItemIds]
-    );
-    return result.rows;
-  }
-
-  const result = await pool.query(
-    `
+  let query = `
     SELECT
       account_id,
       user_id,
@@ -1509,11 +533,25 @@ async function getAccountsForUser(userId, selectedItemIds = null, selectedAccoun
       available_balance
     FROM plaid_accounts
     WHERE user_id = $1
-    ORDER BY institution_name ASC, name ASC
-    `,
-    [userId]
-  );
+  `;
+  const params = [userId];
+  let idx = 2;
 
+  if (selectedItemIds && selectedItemIds.length > 0) {
+    query += ` AND item_id = ANY($${idx}::text[])`;
+    params.push(selectedItemIds);
+    idx += 1;
+  }
+
+  if (selectedAccountIds && selectedAccountIds.length > 0) {
+    query += ` AND account_id = ANY($${idx}::text[])`;
+    params.push(selectedAccountIds);
+    idx += 1;
+  }
+
+  query += ` ORDER BY institution_name ASC, name ASC`;
+
+  const result = await pool.query(query, params);
   return result.rows;
 }
 
@@ -1527,7 +565,6 @@ async function getItemSyncState(itemId) {
     `,
     [itemId]
   );
-
   return result.rows[0] || null;
 }
 
@@ -1684,7 +721,6 @@ async function getStoredTransactionsForUser(
       AND t.date >= $2
       AND t.date <= $3
   `;
-
   const params = [userId, startDate, endDate];
   let idx = 4;
 
@@ -1708,70 +744,55 @@ async function getStoredTransactionsForUser(
     transaction_id: row.transaction_id,
     account_id: row.account_id,
     _item_id: row._item_id,
-    date:
-      row.date instanceof Date
-        ? row.date.toISOString().slice(0, 10)
-        : String(row.date).slice(0, 10),
+    date: row.date,
     name: row.name,
     merchant_name: row.merchant_name,
     amount: row.amount,
-    pending: !!row.pending,
-    personal_finance_category: row.category_primary
-      ? { primary: row.category_primary }
-      : null,
+    pending: row.pending,
+    category_primary: row.category_primary,
     _institution_name: row._institution_name || null,
     _account_name: row._account_name || null,
     _account_mask: row._account_mask || null,
+    status: row.pending ? "pending" : "posted",
   }));
-}
-
-function getCurrentMonthKey() {
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, "0");
-  return `${year}-${month}`;
 }
 
 async function getBudgetsForMonth(userId, monthKey) {
   const result = await pool.query(
     `
     SELECT category_name, budget_amount
-    FROM user_budgets
+    FROM category_budgets
     WHERE user_id = $1 AND month_key = $2
     ORDER BY category_name ASC
     `,
     [userId, monthKey]
   );
-
   return result.rows;
 }
 
-async function upsertBudgetsForMonth(userId, monthKey, budgets) {
+async function saveBudgetsForMonth(userId, monthKey, budgets) {
   const client = await pool.connect();
-
   try {
     await client.query("BEGIN");
+    await client.query(
+      `DELETE FROM category_budgets WHERE user_id = $1 AND month_key = $2`,
+      [userId, monthKey]
+    );
 
     for (const budget of budgets) {
       const categoryName = String(budget.category_name || "").trim();
-      const budgetAmount = Number(budget.budget_amount);
+      const amount = Number(budget.budget_amount || 0);
 
-      if (!categoryName || !Number.isFinite(budgetAmount) || budgetAmount < 0) {
-        continue;
-      }
+      if (!categoryName || Number.isNaN(amount)) continue;
 
       await client.query(
         `
-        INSERT INTO user_budgets (
+        INSERT INTO category_budgets (
           user_id, month_key, category_name, budget_amount, updated_at
         )
         VALUES ($1, $2, $3, $4, NOW())
-        ON CONFLICT (user_id, month_key, category_name)
-        DO UPDATE SET
-          budget_amount = EXCLUDED.budget_amount,
-          updated_at = NOW()
         `,
-        [userId, monthKey, categoryName, budgetAmount]
+        [userId, monthKey, categoryName, amount]
       );
     }
 
@@ -1784,79 +805,8 @@ async function upsertBudgetsForMonth(userId, monthKey, budgets) {
   }
 }
 
-function buildBudgetProgress(spentByCategoryRaw, savedBudgets) {
-  const savedMap = {};
-  for (const row of savedBudgets) {
-    savedMap[row.category_name] = Number(row.budget_amount);
-  }
-
-  const allCategories = new Set([
-    ...Object.keys(spentByCategoryRaw),
-    ...Object.keys(savedMap),
-  ]);
-
-  const categoryProgress = Array.from(allCategories)
-    .map((category) => {
-      const spent = Number((spentByCategoryRaw[category] || 0).toFixed(2));
-      const budget = Number((savedMap[category] || 0).toFixed(2));
-      const remaining = Number((budget - spent).toFixed(2));
-      const percentUsed = budget > 0 ? Number(((spent / budget) * 100).toFixed(1)) : 0;
-
-      let status = "no_budget";
-      if (budget > 0 && spent > budget) {
-        status = "over";
-      } else if (budget > 0 && percentUsed >= 80) {
-        status = "warning";
-      } else if (budget > 0) {
-        status = "good";
-      }
-
-      return {
-        category,
-        budget,
-        spent,
-        remaining,
-        percentUsed,
-        status,
-      };
-    })
-    .sort((a, b) => {
-      if (a.status === "over" && b.status !== "over") return -1;
-      if (a.status !== "over" && b.status === "over") return 1;
-      return b.spent - a.spent;
-    });
-
-  const totalBudget = Number(
-    categoryProgress.reduce((sum, row) => sum + row.budget, 0).toFixed(2)
-  );
-  const totalSpent = Number(
-    categoryProgress.reduce((sum, row) => sum + row.spent, 0).toFixed(2)
-  );
-  const totalRemaining = Number((totalBudget - totalSpent).toFixed(2));
-  const totalPercentUsed =
-    totalBudget > 0 ? Number(((totalSpent / totalBudget) * 100).toFixed(1)) : 0;
-
-  let overallStatus = "no_budget";
-  if (totalBudget > 0 && totalSpent > totalBudget) {
-    overallStatus = "over";
-  } else if (totalBudget > 0 && totalPercentUsed >= 80) {
-    overallStatus = "warning";
-  } else if (totalBudget > 0) {
-    overallStatus = "good";
-  }
-
-  return {
-    totalBudget,
-    totalSpent,
-    totalRemaining,
-    totalPercentUsed,
-    overallStatus,
-    categoryProgress,
-  };
-}
-
 // =========================
-// Plaid transaction helpers
+// Plaid sync
 // =========================
 async function syncTransactionsForItem(itemRow, webhookCode = null) {
   const userId = itemRow.user_id;
@@ -1869,11 +819,7 @@ async function syncTransactionsForItem(itemRow, webhookCode = null) {
   let nextCursor = originalCursor;
   let hasMore = true;
 
-  const accumulated = {
-    added: [],
-    modified: [],
-    removed: [],
-  };
+  const accumulated = { added: [], modified: [], removed: [] };
 
   while (hasMore) {
     try {
@@ -1893,16 +839,6 @@ async function syncTransactionsForItem(itemRow, webhookCode = null) {
       cursor = data.next_cursor;
     } catch (err) {
       const errorCode = err?.response?.data?.error_code;
-      const errorType = err?.response?.data?.error_type;
-      const requestId = err?.response?.data?.request_id;
-
-      console.error("transactionsSync error:", {
-        itemId,
-        errorCode,
-        errorType,
-        requestId,
-        message: err?.message,
-      });
 
       if (errorCode === "TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION") {
         cursor = originalCursor;
@@ -1930,6 +866,796 @@ async function syncTransactionsForItem(itemRow, webhookCode = null) {
   };
 }
 
+// =========================
+// Analytics builders
+// =========================
+function buildTransactionsByMonth(transactions, start, end) {
+  const groups = {};
+
+  for (const tx of transactions) {
+    const key = monthKeyFromDateString(tx.date);
+    if (!groups[key]) groups[key] = [];
+
+    groups[key].push({
+      id: tx.transaction_id,
+      name: tx.name || "Unknown",
+      date: tx.date,
+      amount: Number((tx.amount || 0).toFixed(2)),
+      category: formattedCategory(tx),
+      institutionName: tx._institution_name || null,
+      accountName: tx._account_name || null,
+      accountMask: tx._account_mask || null,
+      item_id: tx._item_id || null,
+      account_id: tx.account_id || null,
+      pending: tx.pending ?? false,
+      status: tx.pending ? "pending" : "posted",
+    });
+  }
+
+  const months = Object.entries(groups)
+    .map(([month, txs]) => ({
+      month,
+      totalSpent: Number(txs.reduce((sum, t) => sum + t.amount, 0).toFixed(2)),
+      count: txs.length,
+      pendingCount: txs.filter((t) => t.pending === true || t.status === "pending").length,
+      postedCount: txs.filter((t) => !(t.pending === true || t.status === "pending")).length,
+      transactions: txs.sort((a, b) => String(b.date).localeCompare(String(a.date))),
+    }))
+    .sort((a, b) => b.month.localeCompare(a.month));
+
+  return {
+    range: {
+      start_date: start,
+      end_date: end,
+    },
+    months,
+  };
+}
+
+function buildMonthlyTrend(transactions) {
+  const grouped = {};
+  for (const tx of transactions) {
+    const key = monthKeyFromDateString(tx.date);
+    grouped[key] = (grouped[key] || 0) + Number(tx.amount || 0);
+  }
+
+  return Object.entries(grouped)
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([month, totalSpent]) => ({
+      month,
+      label: monthDisplay(month),
+      totalSpent: Number(totalSpent.toFixed(2)),
+    }));
+}
+
+function buildCategoryChartData(transactions) {
+  const totals = sumByCategory(transactions);
+  const items = topEntries(totals, 8);
+  const grandTotal = items.reduce((sum, item) => sum + item.amount, 0);
+
+  return items.map((item) => ({
+    category: item.name,
+    amount: item.amount,
+    percentage: grandTotal > 0 ? Number(((item.amount / grandTotal) * 100).toFixed(1)) : 0,
+  }));
+}
+
+function findRecurringCharges(transactions) {
+  const grouped = {};
+
+  for (const tx of transactions) {
+    const merchant = normalizeMerchant(tx);
+    if (!grouped[merchant]) grouped[merchant] = [];
+    grouped[merchant].push(tx);
+  }
+
+  const recurring = [];
+
+  for (const [merchant, txs] of Object.entries(grouped)) {
+    if (txs.length < 2) continue;
+
+    const total = txs.reduce((sum, t) => sum + Number(t.amount || 0), 0);
+    recurring.push({
+      merchant,
+      count: txs.length,
+      total: Number(total.toFixed(2)),
+      average: Number((total / txs.length).toFixed(2)),
+    });
+  }
+
+  return recurring.sort((a, b) => b.total - a.total).slice(0, 10);
+}
+
+function buildBudgetScore(currentSpent, previousSpent, recurringCharges, topCategoryAmount) {
+  let score = 100;
+
+  if (currentSpent > previousSpent) {
+    score -= Math.min(20, Math.round((currentSpent - previousSpent) / 10));
+  }
+
+  if (recurringCharges.length >= 3) {
+    score -= 10;
+  }
+
+  if (currentSpent > 0 && topCategoryAmount > currentSpent * 0.5) {
+    score -= 10;
+  }
+
+  return Math.max(35, Math.min(100, score));
+}
+
+function buildSavingsOpportunities(topCategories, recurringCharges) {
+  const opportunities = [];
+
+  const actionableTopCategory = topCategories.find(
+    (c) => !NON_ACTIONABLE_CATEGORIES.has(String(c.name || "").replaceAll(" ", "_").toUpperCase())
+  );
+
+  if (actionableTopCategory) {
+    opportunities.push({
+      title: `Reduce ${actionableTopCategory.name}`,
+      amount: Number((actionableTopCategory.amount * 0.15).toFixed(2)),
+      message: `Cutting 15% from ${actionableTopCategory.name} could save about $${(
+        actionableTopCategory.amount * 0.15
+      ).toFixed(2)}.`,
+    });
+  }
+
+  if (recurringCharges[0]) {
+    opportunities.push({
+      title: `Review ${recurringCharges[0].merchant}`,
+      amount: recurringCharges[0].average,
+      message: `${recurringCharges[0].merchant} appears recurring. Reviewing it could save about $${recurringCharges[0].average.toFixed(
+        2
+      )} per cycle.`,
+    });
+  }
+
+  return opportunities.slice(0, 3);
+}
+
+function buildActionItems(currentSpent, previousSpent, topCategories, recurringCharges) {
+  const items = [];
+  const actionableTopCategory = topCategories.find(
+    (c) => !NON_ACTIONABLE_CATEGORIES.has(String(c.name || "").replaceAll(" ", "_").toUpperCase())
+  );
+
+  if (currentSpent > previousSpent) {
+    items.push("Your spending is up from the previous period. Review your largest flexible category first.");
+  }
+
+  if (actionableTopCategory) {
+    items.push(`Your biggest adjustable category is ${actionableTopCategory.name}. That is the fastest place to cut.`);
+  }
+
+  if (recurringCharges.length > 0) {
+    items.push(`You have ${recurringCharges.length} recurring charge pattern(s). Review subscriptions and repeated services.`);
+  }
+
+  if (items.length === 0) {
+    items.push("Your spending is stable. Keep tracking your top categories to stay on target.");
+  }
+
+  return items.slice(0, 4);
+}
+
+function buildRiskFlags(currentSpent, previousSpent, topCategories, recurringCharges) {
+  const flags = [];
+
+  if (currentSpent > previousSpent * 1.2 && previousSpent > 0) {
+    flags.push("Spending increased sharply versus the prior 30 days.");
+  }
+
+  if (topCategories[0] && currentSpent > 0 && topCategories[0].amount > currentSpent * 0.5) {
+    flags.push(`More than half of your spending is concentrated in ${topCategories[0].name}.`);
+  }
+
+  if (recurringCharges.length >= 3) {
+    flags.push("Several recurring charges were detected.");
+  }
+
+  return flags;
+}
+
+function buildActionableMessages(currentTransactions, previousTransactions) {
+  const currentSpent = currentTransactions.reduce((sum, t) => sum + Number(t.amount || 0), 0);
+  const previousSpent = previousTransactions.reduce((sum, t) => sum + Number(t.amount || 0), 0);
+  const currentCategories = sumByCategory(currentTransactions);
+  const previousCategories = sumByCategory(previousTransactions);
+  const currentMerchants = sumByMerchant(currentTransactions);
+
+  const messages = [];
+
+  const topCategory = topEntries(currentCategories, 1)[0];
+  if (topCategory && !NON_ACTIONABLE_CATEGORIES.has(String(topCategory.name || "").replaceAll(" ", "_").toUpperCase())) {
+    messages.push({
+      title: `${topCategory.name} is your biggest adjustable category`,
+      message: `You spent $${topCategory.amount.toFixed(2)} on ${topCategory.name}. This is the fastest category to target if you want quick savings.`,
+      impact: "high",
+      suggestedAction: `Try cutting ${topCategory.name} by 10–15% this month.`,
+    });
+  }
+
+  const topMerchant = topEntries(currentMerchants, 1)[0];
+  if (topMerchant) {
+    messages.push({
+      title: `${topMerchant.name} is your top merchant`,
+      message: `Your highest merchant spend was $${topMerchant.amount.toFixed(2)} with ${topMerchant.name}.`,
+      impact: "medium",
+      suggestedAction: `Review whether that merchant reflects a habit you want to change.`,
+    });
+  }
+
+  if (currentSpent > previousSpent) {
+    const increase = currentSpent - previousSpent;
+    messages.push({
+      title: "Your spending increased",
+      message: `You spent $${increase.toFixed(2)} more than the previous 30-day period.`,
+      impact: "high",
+      suggestedAction: "Check the category and merchant sections to see what changed.",
+    });
+  }
+
+  for (const [category, amount] of Object.entries(currentCategories)) {
+    const prev = previousCategories[category] || 0;
+    const change = percentChange(amount, prev);
+    const raw = String(category).replaceAll(" ", "_").toUpperCase();
+
+    if (!NON_ACTIONABLE_CATEGORIES.has(raw) && amount >= 50 && change >= 25) {
+      messages.push({
+        title: `${category} is rising`,
+        message: `You spent $${amount.toFixed(2)} on ${category}, up ${change}% from the prior period.`,
+        impact: "medium",
+        suggestedAction: `Watch your ${category} spending over the next 2 weeks.`,
+      });
+    }
+  }
+
+  return messages.slice(0, 5);
+}
+
+function buildRuleInsights(currentTransactions, previousTransactions) {
+  const currentSpent = currentTransactions.reduce((sum, t) => sum + Number(t.amount || 0), 0);
+  const previousSpent = previousTransactions.reduce((sum, t) => sum + Number(t.amount || 0), 0);
+
+  const currentCategories = sumByCategory(currentTransactions);
+  const previousCategories = sumByCategory(previousTransactions);
+  const currentMerchants = sumByMerchant(currentTransactions);
+  const recurring = findRecurringCharges(currentTransactions);
+
+  const topCategory = topEntries(currentCategories, 1)[0] || null;
+  const topMerchant = topEntries(currentMerchants, 1)[0] || null;
+
+  const insights = [];
+
+  if (topCategory) {
+    insights.push({
+      type: "top_category",
+      title: `Top spending category: ${topCategory.name}`,
+      message: `${topCategory.name} was your biggest category at $${topCategory.amount.toFixed(2)} in the last 30 days.`,
+      priority: "high",
+    });
+  }
+
+  if (topMerchant) {
+    insights.push({
+      type: "top_merchant",
+      title: `Biggest merchant: ${topMerchant.name}`,
+      message: `Your highest spend with a single merchant was ${topMerchant.name} at $${topMerchant.amount.toFixed(2)}.`,
+      priority: "medium",
+    });
+  }
+
+  const overallChange = percentChange(currentSpent, previousSpent);
+  if (currentSpent > previousSpent) {
+    insights.push({
+      type: "spending_up",
+      title: "Spending increased",
+      message: `You spent $${currentSpent.toFixed(2)} in the last 30 days, up ${overallChange}% from the previous period.`,
+      priority: "high",
+    });
+  } else if (currentSpent < previousSpent) {
+    insights.push({
+      type: "spending_down",
+      title: "Spending decreased",
+      message: `You spent $${currentSpent.toFixed(2)} in the last 30 days, down ${Math.abs(overallChange)}% from the previous period.`,
+      priority: "good",
+    });
+  }
+
+  for (const [category, amount] of Object.entries(currentCategories)) {
+    const prev = previousCategories[category] || 0;
+    const change = percentChange(amount, prev);
+    const raw = String(category).replaceAll(" ", "_").toUpperCase();
+
+    if (!NON_ACTIONABLE_CATEGORIES.has(raw) && amount >= 50 && change >= 30) {
+      insights.push({
+        type: "category_jump",
+        title: `${category} is trending up`,
+        message: `You spent $${amount.toFixed(2)} on ${category}, which is up ${change}% from the prior 30 days.`,
+        priority: "medium",
+      });
+    }
+  }
+
+  if (recurring.length > 0) {
+    const topRecurring = recurring[0];
+    insights.push({
+      type: "recurring",
+      title: "Recurring charges detected",
+      message: `You have recurring spending with ${topRecurring.merchant}. It appeared ${topRecurring.count} times and totaled $${topRecurring.total.toFixed(2)}.`,
+      priority: "medium",
+    });
+  }
+
+  return insights.slice(0, 6);
+}
+
+function buildFixedVsFlexibleBreakdown(currentTransactions) {
+  let fixed = 0;
+  let flexible = 0;
+
+  for (const tx of currentTransactions) {
+    const amount = Number(tx.amount || 0);
+    if (isFixedCategory(rawCategory(tx))) fixed += amount;
+    else flexible += amount;
+  }
+
+  const total = fixed + flexible;
+
+  return {
+    fixed: Number(fixed.toFixed(2)),
+    flexible: Number(flexible.toFixed(2)),
+    fixedPercent: safePercent(fixed, total),
+    flexiblePercent: safePercent(flexible, total),
+  };
+}
+
+function buildEssentialVsNonEssentialBreakdown(currentTransactions) {
+  let essential = 0;
+  let nonEssential = 0;
+
+  for (const tx of currentTransactions) {
+    const amount = Number(tx.amount || 0);
+    if (isEssentialCategory(rawCategory(tx))) essential += amount;
+    else nonEssential += amount;
+  }
+
+  const total = essential + nonEssential;
+
+  return {
+    essential: Number(essential.toFixed(2)),
+    nonEssential: Number(nonEssential.toFixed(2)),
+    essentialPercent: safePercent(essential, total),
+    nonEssentialPercent: safePercent(nonEssential, total),
+  };
+}
+
+function buildSubscriptionInsights(currentTransactions) {
+  const grouped = {};
+
+  for (const tx of currentTransactions) {
+    const merchant = normalizeMerchant(tx).toUpperCase();
+    const raw = rawCategory(tx);
+
+    const likelySubscription =
+      SUBSCRIPTION_KEYWORDS.some((word) => merchant.includes(word)) ||
+      merchant.includes("SUBSCRIPTION") ||
+      merchant.includes("MEMBERSHIP") ||
+      raw === "GENERAL_SERVICES";
+
+    if (!likelySubscription) continue;
+
+    if (!grouped[merchant]) grouped[merchant] = [];
+    grouped[merchant].push(tx);
+  }
+
+  const subscriptions = [];
+
+  for (const [merchant, txs] of Object.entries(grouped)) {
+    txs.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    const total = txs.reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+    const average = txs.length ? total / txs.length : 0;
+    const category = txs[0] ? formattedCategory(txs[0]) : null;
+
+    subscriptions.push({
+      merchant,
+      count: txs.length,
+      total: Number(total.toFixed(2)),
+      average: Number(average.toFixed(2)),
+      frequency: txs.length >= 2 ? "Recurring" : "Likely recurring",
+      firstDate: txs[0]?.date || null,
+      lastDate: txs[txs.length - 1]?.date || null,
+      nextExpectedDate: null,
+      category,
+    });
+  }
+
+  subscriptions.sort((a, b) => b.average - a.average);
+
+  const totalMonthlySubscriptionSpend = subscriptions.reduce((sum, s) => sum + s.average, 0);
+
+  return {
+    subscriptions: subscriptions.slice(0, 10),
+    totalMonthlySubscriptionSpend: Number(totalMonthlySubscriptionSpend.toFixed(2)),
+  };
+}
+
+function buildSmartSavingsTips(currentTransactions, topCategories, subscriptionInsights) {
+  const tips = [];
+
+  const actionableTopCategory = topCategories.find(
+    (c) => !NON_ACTIONABLE_CATEGORIES.has(String(c.name || "").replaceAll(" ", "_").toUpperCase())
+  );
+
+  if (actionableTopCategory) {
+    tips.push({
+      title: `Lower ${actionableTopCategory.name}`,
+      message: `Your best adjustable category is ${actionableTopCategory.name}. Even a small cut here would have the biggest impact.`,
+      estimatedSavings: Number((actionableTopCategory.amount * 0.1).toFixed(2)),
+    });
+  }
+
+  if (subscriptionInsights.subscriptions.length > 0) {
+    const s = subscriptionInsights.subscriptions[0];
+    tips.push({
+      title: `Review ${s.merchant}`,
+      message: `${s.merchant} looks like a recurring charge. Canceling or downgrading it may free up easy monthly savings.`,
+      estimatedSavings: Number(s.average.toFixed(2)),
+    });
+  }
+
+  const foodSpend = currentTransactions
+    .filter((tx) => rawCategory(tx) === "FOOD_AND_DRINK")
+    .reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+
+  if (foodSpend > 100) {
+    tips.push({
+      title: "Cut Food And Drink slightly",
+      message: "Food and drink is often one of the easiest categories to trim without changing fixed obligations.",
+      estimatedSavings: Number((foodSpend * 0.08).toFixed(2)),
+    });
+  }
+
+  return tips.slice(0, 5);
+}
+
+function buildMoneyInsights(currentTransactions, previousTransactions, sixMonthTransactions) {
+  const currentSpent = currentTransactions.reduce((sum, t) => sum + Number(t.amount || 0), 0);
+  const previousSpent = previousTransactions.reduce((sum, t) => sum + Number(t.amount || 0), 0);
+
+  const categoryTotals = sumByCategory(currentTransactions);
+  const merchantTotals = sumByMerchant(currentTransactions);
+  const recurringCharges = findRecurringCharges(currentTransactions);
+  const insights = buildRuleInsights(currentTransactions, previousTransactions);
+  const topCategories = topEntries(categoryTotals, 5);
+  const topMerchants = topEntries(merchantTotals, 5);
+
+  const topCategoryAmount = topCategories[0]?.amount || 0;
+  const budgetScore = buildBudgetScore(currentSpent, previousSpent, recurringCharges, topCategoryAmount);
+
+  const fixedVsFlexible = buildFixedVsFlexibleBreakdown(currentTransactions);
+  const essentialVsNonEssential = buildEssentialVsNonEssentialBreakdown(currentTransactions);
+  const subscriptionInsights = buildSubscriptionInsights(currentTransactions);
+  const smartSavingsTips = buildSmartSavingsTips(currentTransactions, topCategories, subscriptionInsights);
+
+  return {
+    summary: {
+      currentSpent: Number(currentSpent.toFixed(2)),
+      previousSpent: Number(previousSpent.toFixed(2)),
+      changePercent: percentChange(currentSpent, previousSpent),
+      transactionCount: currentTransactions.length,
+    },
+    budgetScore,
+    topCategories,
+    topMerchants,
+    recurringCharges,
+    insights,
+    actionableMessages: buildActionableMessages(currentTransactions, previousTransactions),
+    savingsOpportunities: buildSavingsOpportunities(topCategories, recurringCharges),
+    actionItems: buildActionItems(currentSpent, previousSpent, topCategories, recurringCharges),
+    riskFlags: buildRiskFlags(currentSpent, previousSpent, topCategories, recurringCharges),
+    monthlyTrend: buildMonthlyTrend(sixMonthTransactions),
+    categoryChart: buildCategoryChartData(currentTransactions),
+    fixedVsFlexible: fixedVsFlexible || {
+      fixed: 0,
+      flexible: 0,
+      fixedPercent: 0,
+      flexiblePercent: 0,
+    },
+    essentialVsNonEssential: essentialVsNonEssential || {
+      essential: 0,
+      nonEssential: 0,
+      essentialPercent: 0,
+      nonEssentialPercent: 0,
+    },
+    subscriptionInsights: subscriptionInsights || {
+      totalMonthlySubscriptionSpend: 0,
+      subscriptions: [],
+    },
+    smartSavingsTips: smartSavingsTips || [],
+  };
+}
+
+function buildRichAlerts(currentTransactions, previousTransactions) {
+  const alerts = [];
+
+  const currentSpent = currentTransactions.reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+  const previousSpent = previousTransactions.reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+  const recurringCharges = findRecurringCharges(currentTransactions);
+
+  const change = percentChange(currentSpent, previousSpent);
+
+  if (currentSpent > previousSpent && currentSpent > 0) {
+    alerts.push({
+      type: "SPENDING_SPIKE",
+      title: "Spending spike detected",
+      message: `You spent $${currentSpent.toFixed(2)} in the last 30 days, up ${change}% from the previous period.`,
+      severity: change >= 25 ? "high" : "medium",
+    });
+  }
+
+  if (recurringCharges.length > 0) {
+    alerts.push({
+      type: "RECURRING_CHARGES",
+      title: "Recurring charges detected",
+      message: `${recurringCharges.length} recurring charge pattern(s) were found in your recent transactions.`,
+      severity: recurringCharges.length >= 3 ? "medium" : "low",
+    });
+  }
+
+  const topCategories = topEntries(sumByCategory(currentTransactions), 1);
+  if (topCategories[0] && currentSpent > 0 && topCategories[0].amount > currentSpent * 0.5) {
+    alerts.push({
+      type: "CATEGORY_CONCENTRATION",
+      title: "One category dominates your spending",
+      message: `${topCategories[0].name} makes up most of your recent spending.`,
+      severity: "medium",
+    });
+  }
+
+  return alerts;
+}
+
+function buildWeeklySummary(currentWeekTransactions, previousWeekTransactions) {
+  const currentSpent = currentWeekTransactions.reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+  const previousSpent = previousWeekTransactions.reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+  const topCategories = topEntries(sumByCategory(currentWeekTransactions), 3);
+  const topMerchants = topEntries(sumByMerchant(currentWeekTransactions), 3);
+  const recurringCharges = findRecurringCharges(currentWeekTransactions);
+  const changePercentValue = percentChange(currentSpent, previousSpent);
+
+  const highlights = [];
+
+  if (currentSpent > previousSpent) {
+    highlights.push(`You spent more this week than last week by ${changePercentValue}%.`);
+  } else if (currentSpent < previousSpent) {
+    highlights.push(`You spent less this week than last week by ${Math.abs(changePercentValue)}%.`);
+  } else {
+    highlights.push("Your weekly spending was flat compared with last week.");
+  }
+
+  if (topCategories[0]) {
+    highlights.push(`Your top category this week was ${topCategories[0].name} at $${topCategories[0].amount.toFixed(2)}.`);
+  }
+
+  if (topMerchants[0]) {
+    highlights.push(`Your top merchant this week was ${topMerchants[0].name} at $${topMerchants[0].amount.toFixed(2)}.`);
+  }
+
+  const recommendations = [];
+
+  if (topCategories[0]) {
+    const raw = String(topCategories[0].name).replaceAll(" ", "_").toUpperCase();
+    if (!NON_ACTIONABLE_CATEGORIES.has(raw)) {
+      recommendations.push(`Watch ${topCategories[0].name} next week since it was your largest adjustable category.`);
+    }
+  }
+
+  if (recurringCharges.length > 0) {
+    recommendations.push(`Review recurring charges like ${recurringCharges[0].merchant} for easy savings opportunities.`);
+  }
+
+  if (currentSpent > previousSpent) {
+    recommendations.push("Try to reduce one non-essential category next week to reverse the spending increase.");
+  }
+
+  if (recommendations.length === 0) {
+    recommendations.push("Your spending looks steady. Keep following your current pattern.");
+  }
+
+  return {
+    summary: {
+      currentSpent: Number(currentSpent.toFixed(2)),
+      previousSpent: Number(previousSpent.toFixed(2)),
+      changePercent: changePercentValue,
+      transactionCount: currentWeekTransactions.length,
+    },
+    highlights,
+    recommendations: recommendations.slice(0, 3),
+    topCategories,
+    topMerchants,
+  };
+}
+
+function buildBudgetProgress(currentMonthTransactions, budgets) {
+  const budgetMap = {};
+  for (const item of budgets) {
+    budgetMap[String(item.category_name)] = Number(item.budget_amount || 0);
+  }
+
+  const spentByCategory = sumByCategory(currentMonthTransactions);
+  const allCategories = Array.from(
+    new Set([...Object.keys(spentByCategory), ...Object.keys(budgetMap)])
+  ).sort((a, b) => a.localeCompare(b));
+
+  const categoryProgress = allCategories.map((category) => {
+    const budget = Number(budgetMap[category] || 0);
+    const spent = Number((spentByCategory[category] || 0).toFixed(2));
+    const remaining = Number((budget - spent).toFixed(2));
+    const percentUsed = budget > 0 ? Number(((spent / budget) * 100).toFixed(1)) : 0;
+    const status = classifyBudgetStatus(percentUsed, remaining, budget);
+
+    return {
+      category,
+      budget: Number(budget.toFixed(2)),
+      spent,
+      remaining,
+      percentUsed,
+      status,
+    };
+  });
+
+  const totalBudget = Number(
+    categoryProgress.reduce((sum, row) => sum + row.budget, 0).toFixed(2)
+  );
+  const totalSpent = Number(
+    categoryProgress.reduce((sum, row) => sum + row.spent, 0).toFixed(2)
+  );
+  const totalRemaining = Number((totalBudget - totalSpent).toFixed(2));
+  const totalPercentUsed = totalBudget > 0
+    ? Number(((totalSpent / totalBudget) * 100).toFixed(1))
+    : 0;
+  const overallStatus = classifyBudgetStatus(totalPercentUsed, totalRemaining, totalBudget);
+
+  return {
+    totalBudget,
+    totalSpent,
+    totalRemaining,
+    totalPercentUsed,
+    overallStatus,
+    categoryProgress,
+  };
+}
+
+function buildBudgetAIResponse(question, moneyInsights) {
+  const q = question.toLowerCase();
+
+  const topCategory = moneyInsights.topCategories.find(
+    (c) => !NON_ACTIONABLE_CATEGORIES.has(String(c.name || "").replaceAll(" ", "_").toUpperCase())
+  ) || moneyInsights.topCategories[0];
+
+  const topMerchant = moneyInsights.topMerchants[0];
+  const recurring = moneyInsights.recurringCharges[0];
+  const currentSpent = moneyInsights.summary.currentSpent;
+  const previousSpent = moneyInsights.summary.previousSpent;
+  const changePercentValue = moneyInsights.summary.changePercent;
+
+  let answer = "";
+  let suggestions = [];
+  let score = moneyInsights.budgetScore || 70;
+
+  if (q.includes("wasting") || q.includes("waste")) {
+    answer = topCategory
+      ? `Your biggest adjustable spending pressure is **${topCategory.name}** at **$${topCategory.amount.toFixed(2)}**. ${
+          recurring
+            ? `You also have recurring spending with **${recurring.merchant}** totaling **$${recurring.total.toFixed(2)}**. `
+            : ""
+        }The easiest place to cut first is your largest flexible category.`
+      : "I don't have enough spending data yet to identify waste areas.";
+
+    suggestions = [
+      "What should I cut first?",
+      "Show my recurring charges",
+      "How much could I save this month?"
+    ];
+  } else if (q.includes("save") || q.includes("saving")) {
+    if (moneyInsights.savingsOpportunities.length > 0) {
+      const topOpportunity = moneyInsights.savingsOpportunities[0];
+      answer = `Your best near-term savings move is **${topOpportunity.title}**. ${topOpportunity.message}`;
+    } else {
+      answer = "I don't have a strong savings recommendation yet. Keep tracking your top categories.";
+    }
+
+    suggestions = [
+      "What category is hurting me most?",
+      "Show my biggest merchant",
+      "Did my spending increase?"
+    ];
+  } else if (q.includes("biggest expense") || q.includes("top category")) {
+    answer = topCategory
+      ? `Your top adjustable spending category is **${topCategory.name}** at **$${topCategory.amount.toFixed(2)}** in the last 30 days.`
+      : "I don't have enough data yet to find your biggest expense.";
+
+    suggestions = [
+      "Where am I wasting money?",
+      "What should I cut first?",
+      "Show my top merchants"
+    ];
+  } else if (q.includes("merchant")) {
+    answer = topMerchant
+      ? `Your biggest merchant spend was **${topMerchant.name}** at **$${topMerchant.amount.toFixed(2)}**.`
+      : "I don't have enough merchant data yet.";
+
+    suggestions = [
+      "What did I spend the most on?",
+      "Show recurring charges",
+      "Did I spend more than last month?"
+    ];
+  } else if (q.includes("subscription") || q.includes("recurring")) {
+    if (moneyInsights.recurringCharges.length === 0) {
+      answer = "I did not detect recurring charges in the last 30 days.";
+    } else {
+      const lines = moneyInsights.recurringCharges
+        .slice(0, 3)
+        .map((r) => `- **${r.merchant}**: ${r.count} charges totaling **$${r.total.toFixed(2)}**`)
+        .join("\n");
+
+      answer = `Here are your top recurring charges:\n${lines}`;
+    }
+
+    suggestions = [
+      "Which recurring charge is biggest?",
+      "How much could I save?",
+      "Where am I wasting money?"
+    ];
+  } else if (q.includes("more than last month") || q.includes("spend more") || q.includes("last month")) {
+    answer =
+      currentSpent > previousSpent
+        ? `Yes — you spent **$${currentSpent.toFixed(2)}** in the last 30 days versus **$${previousSpent.toFixed(2)}** in the previous period, which is **up ${changePercentValue}%**.`
+        : `No — you spent **$${currentSpent.toFixed(2)}** in the last 30 days versus **$${previousSpent.toFixed(2)}** in the previous period, which is **down ${Math.abs(changePercentValue)}%**.`;
+
+    suggestions = [
+      "What category increased the most?",
+      "Where am I wasting money?",
+      "What should I cut first?"
+    ];
+  } else if (q.includes("budget score") || q.includes("score")) {
+    answer = `Your current **Budget Score** is **${moneyInsights.budgetScore}/100**. ${
+      moneyInsights.riskFlags.length > 0
+        ? `The biggest issues are: ${moneyInsights.riskFlags.join(" ")}`
+        : "Your spending pattern looks fairly stable right now."
+    }`;
+
+    suggestions = [
+      "How can I improve my score?",
+      "What should I cut first?",
+      "Show my savings opportunities"
+    ];
+  } else {
+    const insightLines = moneyInsights.insights
+      .slice(0, 3)
+      .map((i) => `- ${i.message}`)
+      .join("\n");
+
+    answer = `Here’s your current money snapshot:\n${insightLines}`;
+    suggestions = [
+      "Where am I wasting money?",
+      "What did I spend the most on?",
+      "How much could I save?"
+    ];
+  }
+
+  return {
+    answer,
+    suggestions,
+    score,
+  };
+}
+
+// =========================
+// Selection helper
+// =========================
 async function requireSelectionOrAll(req, res) {
   const userId = getUserId(req);
   const selectedItemIds = getSelectedItemIds(req);
@@ -1950,66 +1676,18 @@ async function requireSelectionOrAll(req, res) {
     }
   }
 
-  return { userId, selectedItemIds, selectedAccountIds, items };
+  return {
+    userId,
+    selectedItemIds,
+    selectedAccountIds,
+    items,
+  };
 }
-
-async function initialFullTransactionSync(itemRow) {
-  const userId = itemRow.user_id;
-  const itemId = itemRow.item_id;
-
-  const end = new Date();
-  const start = new Date();
-  start.setMonth(end.getMonth() - 6); // last 6 months
-
-  const startDate = start.toISOString().slice(0, 10);
-  const endDate = end.toISOString().slice(0, 10);
-
-  const transactions = await getTransactionsForOneItem(
-    itemRow,
-    startDate,
-    endDate
-  );
-
-  await applyTransactionSyncUpdates(userId, itemId, {
-    added: transactions,
-    modified: [],
-    removed: [],
-  });
-
-  console.log(`Initial sync complete: ${transactions.length} transactions`);
-
-  return transactions.length;
-}
-
-// =========================
-// Apply limiters before routes
-// =========================
-app.use("/", generalLimiter);
-app.use("/health", generalLimiter);
-app.use("/connection_status", generalLimiter);
-app.use("/connected_accounts", generalLimiter);
-app.use("/alerts", generalLimiter);
-app.use("/insights", generalLimiter);
-app.use("/transactions_by_month", generalLimiter);
-app.use("/money_insights", generalLimiter);
-app.use("/category_chart", generalLimiter);
-app.use("/weekly_summary", generalLimiter);
-app.use("/spending_by_account", generalLimiter);
-
-app.use("/create_link_token", plaidLimiter);
-app.use("/exchange_public_token", plaidLimiter);
-app.use("/sync_connected_accounts", plaidLimiter);
-app.use("/sync_transactions", plaidLimiter);
-app.use("/disconnect_bank", plaidLimiter);
-app.use("/plaid/webhook", plaidLimiter);
-
-app.use("/ai_recommendations", aiLimiter);
-app.use("/ask_budget_ai", aiLimiter);
 
 // =========================
 // Routes
 // =========================
-app.get("/", (_req, res) => {
+app.get("/", generalLimiter, (_req, res) => {
   res.json({
     ok: true,
     message: "BudgetSaver backend is running.",
@@ -2017,11 +1695,11 @@ app.get("/", (_req, res) => {
   });
 });
 
-app.get("/health", (_req, res) => {
+app.get("/health", generalLimiter, (_req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/connection_status", async (req, res) => {
+app.get("/connection_status", generalLimiter, async (req, res) => {
   try {
     const userId = getUserId(req);
     const items = await getUserItems(userId);
@@ -2041,7 +1719,7 @@ app.get("/connection_status", async (req, res) => {
   }
 });
 
-app.get("/connected_accounts", async (req, res) => {
+app.get("/connected_accounts", generalLimiter, async (req, res) => {
   try {
     const userId = getUserId(req);
     const selectedItemIds = getSelectedItemIds(req);
@@ -2066,7 +1744,7 @@ app.get("/connected_accounts", async (req, res) => {
   }
 });
 
-app.post("/sync_connected_accounts", async (req, res) => {
+app.post("/sync_connected_accounts", plaidLimiter, async (req, res) => {
   try {
     const userId = getUserId(req);
     const items = await getUserItems(userId);
@@ -2107,7 +1785,7 @@ app.post("/sync_connected_accounts", async (req, res) => {
   }
 });
 
-app.post("/create_link_token", async (req, res) => {
+app.post("/create_link_token", plaidLimiter, async (req, res) => {
   try {
     const userId = getUserId(req);
 
@@ -2139,52 +1817,7 @@ app.post("/create_link_token", async (req, res) => {
   }
 });
 
-app.post("/sync_transactions", async (req, res) => {
-  try {
-    const userId = getUserId(req);
-    const selectedItemIds = getSelectedItemIds(req);
-
-    const items = await getUserItemsFiltered(userId, selectedItemIds);
-
-    if (items.length === 0) {
-      return res.status(404).json({ error: "No connected items found." });
-    }
-
-    const results = [];
-
-    for (const item of items) {
-      try {
-        const synced = await syncTransactionsForItem(item);
-        results.push({
-          item_id: item.item_id,
-          ok: true,
-          ...synced,
-        });
-      } catch (err) {
-        console.error("sync_transactions item error:", item.item_id, err?.response?.data || err?.message || err);
-        results.push({
-          item_id: item.item_id,
-          ok: false,
-          error: err?.response?.data?.error_message || err?.message || "Unknown sync error",
-        });
-      }
-    }
-
-    const okCount = results.filter((r) => r.ok).length;
-
-    res.json({
-      ok: okCount > 0,
-      syncedItems: okCount,
-      results,
-      syncedAt: new Date().toISOString(),
-    });
-  } catch (err) {
-    console.error("sync_transactions error:", err?.response?.data || err?.message || err);
-    res.status(500).json({ error: "Failed to sync transactions." });
-  }
-});
-
-app.post("/exchange_public_token", async (req, res) => {
+app.post("/exchange_public_token", plaidLimiter, async (req, res) => {
   try {
     const { public_token } = req.body;
     const userId = getUserId(req);
@@ -2204,9 +1837,7 @@ app.post("/exchange_public_token", async (req, res) => {
     let institutionName = "Connected Bank";
 
     try {
-      const itemGetResponse = await plaidClient.itemGet({
-        access_token: accessToken,
-      });
+      const itemGetResponse = await plaidClient.itemGet({ access_token: accessToken });
       institutionId = itemGetResponse.data.item?.institution_id || null;
     } catch (err) {
       console.error("itemGet warning:", err?.response?.data || err?.message || err);
@@ -2228,18 +1859,9 @@ app.post("/exchange_public_token", async (req, res) => {
 
     let accounts = [];
     try {
-      const accountsResponse = await plaidClient.accountsGet({
-        access_token: accessToken,
-      });
-
+      const accountsResponse = await plaidClient.accountsGet({ access_token: accessToken });
       accounts = accountsResponse.data.accounts || [];
-
-      await replaceAccountsForItem(
-        userId,
-        itemId,
-        institutionName,
-        accounts
-      );
+      await replaceAccountsForItem(userId, itemId, institutionName, accounts);
     } catch (err) {
       console.error("accountsGet warning:", err?.response?.data || err?.message || err);
     }
@@ -2269,7 +1891,7 @@ app.post("/exchange_public_token", async (req, res) => {
   }
 });
 
-app.post("/disconnect_bank", async (req, res) => {
+app.post("/disconnect_bank", plaidLimiter, async (req, res) => {
   try {
     const userId = getUserId(req);
     const itemId = req.body?.item_id;
@@ -2285,11 +1907,9 @@ app.post("/disconnect_bank", async (req, res) => {
     }
 
     try {
-      await plaidClient.itemRemove({
-        access_token: saved.access_token,
-      });
+      await plaidClient.itemRemove({ access_token: saved.access_token });
     } catch {
-      // ignore
+      // ignore itemRemove failures
     }
 
     await deleteUserItem(userId, itemId);
@@ -2301,13 +1921,41 @@ app.post("/disconnect_bank", async (req, res) => {
   }
 });
 
-app.get("/alerts", async (req, res) => {
+app.post("/sync_transactions", plaidLimiter, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const selectedItemIds = getSelectedItemIds(req);
+
+    const items = await getUserItemsFiltered(userId, selectedItemIds);
+
+    if (items.length === 0) {
+      return res.status(404).json({ error: "No connected items found." });
+    }
+
+    const results = [];
+
+    for (const item of items) {
+      const synced = await syncTransactionsForItem(item);
+      results.push(synced);
+    }
+
+    res.json({
+      ok: true,
+      syncedItems: results.length,
+      results,
+    });
+  } catch (err) {
+    console.error("sync_transactions error:", err?.response?.data || err?.message || err);
+    res.status(500).json({ error: "Failed to sync transactions." });
+  }
+});
+
+app.get("/alerts", generalLimiter, async (req, res) => {
   try {
     const ctx = await requireSelectionOrAll(req, res);
     if (!ctx) return;
 
     const { userId, selectedItemIds, selectedAccountIds } = ctx;
-
     const currentRange = getDateRangeLast30Days();
     const previousRange = getPrevious30DayRange();
 
@@ -2327,15 +1975,13 @@ app.get("/alerts", async (req, res) => {
       selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
-    const totalSpent = currentTransactions.reduce((sum, tx) => sum + tx.amount, 0);
-    const previousSpent = previousTransactions.reduce((sum, tx) => sum + tx.amount, 0);
-
-    const alerts = buildRichAlerts(currentTransactions, previousTransactions);
+    const totalSpent = currentTransactions.reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+    const previousSpent = previousTransactions.reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
 
     res.json({
       totalSpent: Number(totalSpent.toFixed(2)),
       previousSpent: Number(previousSpent.toFixed(2)),
-      alerts,
+      alerts: buildRichAlerts(currentTransactions, previousTransactions),
       selectedItemCount: selectedItemIds?.length || null,
       selectedAccountCount: selectedAccountIds?.length || null,
     });
@@ -2345,19 +1991,16 @@ app.get("/alerts", async (req, res) => {
   }
 });
 
-app.get("/budgets", async (req, res) => {
+app.get("/budgets", generalLimiter, async (req, res) => {
   try {
     const userId = getUserId(req);
-    const monthKey = String(req.query.monthKey || getCurrentMonthKey());
+    const monthKey = currentMonthKey();
 
     const budgets = await getBudgetsForMonth(userId, monthKey);
 
     res.json({
       monthKey,
-      budgets: budgets.map((row) => ({
-        category_name: row.category_name,
-        budget_amount: Number(row.budget_amount),
-      })),
+      budgets,
     });
   } catch (err) {
     console.error("budgets GET error:", err?.message || err);
@@ -2365,23 +2008,17 @@ app.get("/budgets", async (req, res) => {
   }
 });
 
-app.post("/budgets", async (req, res) => {
+app.post("/budgets", generalLimiter, async (req, res) => {
   try {
     const userId = getUserId(req);
-    const monthKey = String(req.body?.monthKey || getCurrentMonthKey());
+    const monthKey = currentMonthKey();
     const budgets = Array.isArray(req.body?.budgets) ? req.body.budgets : [];
 
-    await upsertBudgetsForMonth(userId, monthKey, budgets);
-
-    const savedBudgets = await getBudgetsForMonth(userId, monthKey);
+    await saveBudgetsForMonth(userId, monthKey, budgets);
 
     res.json({
-      ok: true,
       monthKey,
-      budgets: savedBudgets.map((row) => ({
-        category_name: row.category_name,
-        budget_amount: Number(row.budget_amount),
-      })),
+      budgets: await getBudgetsForMonth(userId, monthKey),
     });
   } catch (err) {
     console.error("budgets POST error:", err?.message || err);
@@ -2389,53 +2026,54 @@ app.post("/budgets", async (req, res) => {
   }
 });
 
-app.get("/insights", async (req, res) => {
+app.get("/insights", generalLimiter, async (req, res) => {
   try {
     const ctx = await requireSelectionOrAll(req, res);
     if (!ctx) return;
 
     const { userId, selectedItemIds, selectedAccountIds } = ctx;
-    const range = getDateRangeLast30Days();
-    const monthKey = getCurrentMonthKey();
+    const monthKey = currentMonthKey();
 
-    const transactions = (await getTransactionsForUser(
+    const start = `${monthKey}-01`;
+    const end = today();
+
+    const transactions = (await getStoredTransactionsForUser(
       userId,
-      range.start,
-      range.end,
+      start,
+      end,
       selectedItemIds,
       selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
-    const spentByCategoryRaw = sumByCategory(transactions);
-    const totalSpent = transactions.reduce((sum, tx) => sum + tx.amount, 0);
-
-    const savedBudgets = await getBudgetsForMonth(userId, monthKey);
-    const budgetProgress = buildBudgetProgress(spentByCategoryRaw, savedBudgets);
+    const budgets = await getBudgetsForMonth(userId, monthKey);
+    const budgetProgress = buildBudgetProgress(transactions, budgets);
 
     res.json({
-      month: getCurrentMonthLabel(),
+      month: new Intl.DateTimeFormat("en-US", {
+        month: "long",
+        year: "numeric",
+      }).format(new Date()),
       monthKey,
       totals: {
         total_transactions: transactions.length,
-        spent: Number(totalSpent.toFixed(2)),
+        spent: Number(transactions.reduce((sum, tx) => sum + Number(tx.amount || 0), 0).toFixed(2)),
       },
       budgetProgress,
       selectedItemCount: selectedItemIds?.length || null,
       selectedAccountCount: selectedAccountIds?.length || null,
     });
   } catch (err) {
-    console.error("insights error:", err?.response?.data || err?.message || err);
+    console.error("insights error:", err?.message || err);
     res.status(500).json({ error: "Failed to build insights." });
   }
 });
 
-app.get("/transactions_by_month", async (req, res) => {
+app.get("/transactions_by_month", generalLimiter, async (req, res) => {
   try {
     const ctx = await requireSelectionOrAll(req, res);
     if (!ctx) return;
 
     const { userId, selectedItemIds, selectedAccountIds } = ctx;
-
     const end = new Date();
     const start = new Date();
     start.setMonth(end.getMonth() - 6);
@@ -2453,14 +2091,12 @@ app.get("/transactions_by_month", async (req, res) => {
 
     res.json(buildTransactionsByMonth(transactions, startDate, endDate));
   } catch (err) {
-  console.error("transactions_by_month error full:", err);
-  console.error("transactions_by_month error message:", err?.message || err);
-  console.error("transactions_by_month error stack:", err?.stack || "no stack");
-  res.status(500).json({ error: "Failed to build transactions by month." });
-}
+    console.error("transactions_by_month error:", err?.response?.data || err?.message || err);
+    res.status(500).json({ error: "Failed to build transactions by month." });
+  }
 });
 
-app.get("/money_insights", async (req, res) => {
+app.get("/money_insights", generalLimiter, async (req, res) => {
   try {
     const ctx = await requireSelectionOrAll(req, res);
     if (!ctx) return;
@@ -2495,92 +2131,26 @@ app.get("/money_insights", async (req, res) => {
       selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
-   const insightData = buildMoneyInsights(
-  currentTransactions,
-  previousTransactions,
-  sixMonthTransactions
-  );
+    const insightData = buildMoneyInsights(
+      currentTransactions,
+      previousTransactions,
+      sixMonthTransactions
+    );
 
-  console.log("money_insights insightData:", JSON.stringify(insightData, null, 2));
+    console.log("money_insights insightData keys:", Object.keys(insightData));
 
-  res.json({
-    ...insightData,
-    selectedItemCount: selectedItemIds?.length || null,
-    selectedAccountCount: selectedAccountIds?.length || null,
-  });
+    res.json({
+      ...insightData,
+      selectedItemCount: selectedItemIds?.length || null,
+      selectedAccountCount: selectedAccountIds?.length || null,
+    });
   } catch (err) {
-    console.error("money_insights error:", err?.response?.data || err?.message || err);
+    console.error("money_insights error:", err?.message || err);
     res.status(500).json({ error: "Failed to build money insights." });
   }
 });
 
-app.get("/category_chart", async (req, res) => {
-  try {
-    const ctx = await requireSelectionOrAll(req, res);
-    if (!ctx) return;
-
-    const { userId, selectedItemIds, selectedAccountIds } = ctx;
-    const range = getDateRangeLast30Days();
-
-    const transactions = (await getStoredTransactionsForUser(
-      userId,
-      range.start,
-      range.end,
-      selectedItemIds,
-      selectedAccountIds
-    )).filter(isDebitLikeTransaction);
-
-    res.json({
-      categories: buildCategoryChartData(transactions),
-      selectedItemCount: selectedItemIds?.length || null,
-      selectedAccountCount: selectedAccountIds?.length || null,
-    });
-  } catch (err) {
-    console.error("category_chart error:", err?.response?.data || err?.message || err);
-    res.status(500).json({ error: "Failed to build category chart." });
-  }
-});
-
-app.get("/weekly_summary", async (req, res) => {
-  try {
-    const ctx = await requireSelectionOrAll(req, res);
-    if (!ctx) return;
-
-    const { userId, selectedItemIds, selectedAccountIds } = ctx;
-
-    const currentWeekRange = getDateRangeLast7Days();
-    const previousWeekRange = getPrevious7DayRange();
-
-    const currentWeekTransactions = (await getStoredTransactionsForUser(
-      userId,
-      currentWeekRange.start,
-      currentWeekRange.end,
-      selectedItemIds,
-      selectedAccountIds
-    )).filter(isDebitLikeTransaction);
-
-    const previousWeekTransactions = (await getStoredTransactionsForUser(
-      userId,
-      previousWeekRange.start,
-      previousWeekRange.end,
-      selectedItemIds,
-      selectedAccountIds
-    )).filter(isDebitLikeTransaction);
-
-    const summary = buildWeeklySummary(currentWeekTransactions, previousWeekTransactions);
-
-    res.json({
-      ...summary,
-      selectedItemCount: selectedItemIds?.length || null,
-      selectedAccountCount: selectedAccountIds?.length || null,
-    });
-  } catch (err) {
-    console.error("weekly_summary error:", err?.response?.data || err?.message || err);
-    res.status(500).json({ error: "Failed to build weekly summary." });
-  }
-});
-
-app.get("/ai_recommendations", async (req, res) => {
+app.get("/ai_recommendations", aiLimiter, async (req, res) => {
   try {
     const ctx = await requireSelectionOrAll(req, res);
     if (!ctx) return;
@@ -2624,7 +2194,7 @@ app.get("/ai_recommendations", async (req, res) => {
     if (!openai) {
       return res.json({
         source: "rule_engine",
-        recommendations: moneyInsights.actionItems.map((item) => ({
+        recommendations: moneyInsights.actionItems.slice(0, 3).map((item) => ({
           title: "Recommended next step",
           message: item,
         })),
@@ -2635,19 +2205,13 @@ app.get("/ai_recommendations", async (req, res) => {
 
     const prompt = `
 You are BudgetSaver AI, a practical personal finance coach.
-
 Use only the data provided.
 Do not invent numbers or merchants.
+Do not recommend cutting loan payments, transfers, or fixed obligations directly.
 Give 3 short, specific recommendations.
-Each recommendation should have:
-- title
-- message
-
-Return valid JSON in this exact format:
+Return valid JSON:
 {
   "recommendations": [
-    { "title": "string", "message": "string" },
-    { "title": "string", "message": "string" },
     { "title": "string", "message": "string" }
   ]
 }
@@ -2684,12 +2248,12 @@ ${JSON.stringify(moneyInsights, null, 2)}
       selectedAccountCount: selectedAccountIds?.length || null,
     });
   } catch (err) {
-    console.error("ai_recommendations error:", err?.response?.data || err?.message || err);
+    console.error("ai_recommendations error:", err?.message || err);
     res.status(500).json({ error: "Failed to build AI recommendations." });
   }
 });
 
-app.post("/ask_budget_ai", async (req, res) => {
+app.post("/ask_budget_ai", aiLimiter, async (req, res) => {
   try {
     const userId = getUserId(req);
     const selectedItemIds = getSelectedItemIds(req);
@@ -2759,15 +2323,15 @@ app.post("/ask_budget_ai", async (req, res) => {
       selectedAccountCount: selectedAccountIds?.length || null,
     });
   } catch (err) {
-    console.error("ask_budget_ai error:", err?.response?.data || err?.message || err);
+    console.error("ask_budget_ai error:", err?.message || err);
     res.status(500).json({
       error: "Failed to answer budget question.",
-      details: err?.response?.data || err?.message || "Unknown error",
+      details: err?.message || "Unknown error",
     });
   }
 });
 
-app.post("/plaid/webhook", async (req, res) => {
+app.post("/plaid/webhook", plaidLimiter, async (req, res) => {
   try {
     const body = req.body;
 
@@ -2795,18 +2359,57 @@ app.post("/plaid/webhook", async (req, res) => {
       const item = result.rows[0];
 
       if (item) {
-        await syncTransactionsForItem(item, body.webhook_code);
+        await syncTransactionsForItem(item, body.webhook_code || null);
       }
     }
 
     res.sendStatus(200);
   } catch (err) {
-    console.error("plaid webhook error:", err?.response?.data || err?.message || err);
+    console.error("plaid webhook error:", err?.message || err);
     res.sendStatus(200);
   }
 });
 
-app.get("/spending_by_account", async (req, res) => {
+app.get("/weekly_summary", generalLimiter, async (req, res) => {
+  try {
+    const ctx = await requireSelectionOrAll(req, res);
+    if (!ctx) return;
+
+    const { userId, selectedItemIds, selectedAccountIds } = ctx;
+
+    const currentWeekRange = getDateRangeLast7Days();
+    const previousWeekRange = getPrevious7DayRange();
+
+    const currentWeekTransactions = (await getStoredTransactionsForUser(
+      userId,
+      currentWeekRange.start,
+      currentWeekRange.end,
+      selectedItemIds,
+      selectedAccountIds
+    )).filter(isDebitLikeTransaction);
+
+    const previousWeekTransactions = (await getStoredTransactionsForUser(
+      userId,
+      previousWeekRange.start,
+      previousWeekRange.end,
+      selectedItemIds,
+      selectedAccountIds
+    )).filter(isDebitLikeTransaction);
+
+    const summary = buildWeeklySummary(currentWeekTransactions, previousWeekTransactions);
+
+    res.json({
+      ...summary,
+      selectedItemCount: selectedItemIds?.length || null,
+      selectedAccountCount: selectedAccountIds?.length || null,
+    });
+  } catch (err) {
+    console.error("weekly_summary error:", err?.message || err);
+    res.status(500).json({ error: "Failed to build weekly summary." });
+  }
+});
+
+app.get("/spending_by_account", generalLimiter, async (req, res) => {
   try {
     const ctx = await requireSelectionOrAll(req, res);
     if (!ctx) return;
@@ -2844,7 +2447,7 @@ app.get("/spending_by_account", async (req, res) => {
 
     for (const tx of transactions) {
       if (!grouped[tx.account_id]) continue;
-      grouped[tx.account_id].spent_30d += tx.amount;
+      grouped[tx.account_id].spent_30d += Number(tx.amount || 0);
       grouped[tx.account_id].transaction_count += 1;
     }
 
@@ -2861,52 +2464,8 @@ app.get("/spending_by_account", async (req, res) => {
       selectedAccountCount: selectedAccountIds?.length || null,
     });
   } catch (err) {
-    console.error("spending_by_account error:", err?.response?.data || err?.message || err);
+    console.error("spending_by_account error:", err?.message || err);
     res.status(500).json({ error: "Failed to build spending by account." });
-  }
-});
-
-app.get("/debug_transactions_preview", async (req, res) => {
-  try {
-    const userId = getUserId(req);
-
-    const countResult = await pool.query(
-      `
-      SELECT COUNT(*)::int AS count
-      FROM plaid_transactions
-      WHERE user_id = $1
-      `,
-      [userId]
-    );
-
-    const sampleResult = await pool.query(
-      `
-      SELECT
-        transaction_id,
-        item_id,
-        account_id,
-        date,
-        name,
-        merchant_name,
-        amount,
-        pending,
-        category_primary
-      FROM plaid_transactions
-      WHERE user_id = $1
-      ORDER BY date DESC
-      LIMIT 10
-      `,
-      [userId]
-    );
-
-    res.json({
-      userId,
-      transactionCount: countResult.rows[0].count,
-      sample: sampleResult.rows,
-    });
-  } catch (err) {
-    console.error("debug_transactions_preview error:", err?.message || err);
-    res.status(500).json({ error: "Failed to preview transactions." });
   }
 });
 
