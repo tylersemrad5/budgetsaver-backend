@@ -156,6 +156,29 @@ function getSelectedItemIds(req) {
   return parseHeaderList(req, "X-SELECTED-ITEM-IDS");
 }
 
+function isoNow() {
+  return new Date().toISOString();
+}
+
+function buildRefreshMeta({
+  source = "server",
+  syncTriggered = false,
+  syncResults = [],
+  userId = null,
+  selectedItemIds = null,
+  selectedAccountIds = null,
+} = {}) {
+  return {
+    refreshedAt: isoNow(),
+    source,
+    syncTriggered,
+    syncResults,
+    selectedItemCount: selectedItemIds?.length || null,
+    selectedAccountCount: selectedAccountIds?.length || null,
+    userId: userId || null,
+  };
+}
+
 function getSelectedAccountIds(req) {
   return parseHeaderList(req, "X-SELECTED-ACCOUNT-IDS");
 }
@@ -891,6 +914,26 @@ function buildTransactionsByMonth(transactions, start, end) {
       status: tx.pending ? "pending" : "posted",
     });
   }
+
+  function buildTransactionStatusSummary(transactions) {
+  const pendingCount = transactions.filter((tx) => tx.pending === true || tx.status === "pending").length;
+  const postedCount = transactions.filter((tx) => !(tx.pending === true || tx.status === "pending")).length;
+
+  const pendingTotal = transactions
+    .filter((tx) => tx.pending === true || tx.status === "pending")
+    .reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+
+  const postedTotal = transactions
+    .filter((tx) => !(tx.pending === true || tx.status === "pending"))
+    .reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+
+  return {
+    pendingCount,
+    postedCount,
+    pendingTotal: Number(pendingTotal.toFixed(2)),
+    postedTotal: Number(postedTotal.toFixed(2)),
+  };
+}
 
   const months = Object.entries(groups)
     .map(([month, txs]) => ({
@@ -1935,14 +1978,39 @@ app.post("/sync_transactions", plaidLimiter, async (req, res) => {
     const results = [];
 
     for (const item of items) {
-      const synced = await syncTransactionsForItem(item);
-      results.push(synced);
+      try {
+        const synced = await syncTransactionsForItem(item);
+        results.push({
+          item_id: item.item_id,
+          institution_name: item.institution_name || "Connected Bank",
+          ok: true,
+          ...synced,
+        });
+      } catch (err) {
+        console.error("sync_transactions item error:", item.item_id, err?.response?.data || err?.message || err);
+        results.push({
+          item_id: item.item_id,
+          institution_name: item.institution_name || "Connected Bank",
+          ok: false,
+          error: err?.response?.data?.error_message || err?.message || "Unknown sync error",
+        });
+      }
     }
 
+    const syncedItems = results.filter((r) => r.ok).length;
+
     res.json({
-      ok: true,
-      syncedItems: results.length,
+      ok: syncedItems > 0,
+      syncedItems,
       results,
+      refreshMeta: buildRefreshMeta({
+        source: "sync_transactions",
+        syncTriggered: true,
+        syncResults: results,
+        userId,
+        selectedItemIds,
+        selectedAccountIds: null,
+      }),
     });
   } catch (err) {
     console.error("sync_transactions error:", err?.response?.data || err?.message || err);
@@ -1950,14 +2018,16 @@ app.post("/sync_transactions", plaidLimiter, async (req, res) => {
   }
 });
 
-app.get("/alerts", generalLimiter, async (req, res) => {
+app.get("/money_insights", generalLimiter, async (req, res) => {
   try {
     const ctx = await requireSelectionOrAll(req, res);
     if (!ctx) return;
 
     const { userId, selectedItemIds, selectedAccountIds } = ctx;
+
     const currentRange = getDateRangeLast30Days();
     const previousRange = getPrevious30DayRange();
+    const sixMonthRange = getDateRangeLastSixMonths();
 
     const currentTransactions = (await getStoredTransactionsForUser(
       userId,
@@ -1975,19 +2045,34 @@ app.get("/alerts", generalLimiter, async (req, res) => {
       selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
-    const totalSpent = currentTransactions.reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
-    const previousSpent = previousTransactions.reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+    const sixMonthTransactions = (await getStoredTransactionsForUser(
+      userId,
+      sixMonthRange.start,
+      sixMonthRange.end,
+      selectedItemIds,
+      selectedAccountIds
+    )).filter(isDebitLikeTransaction);
+
+    const insightData = buildMoneyInsights(
+      currentTransactions,
+      previousTransactions,
+      sixMonthTransactions
+    );
 
     res.json({
-      totalSpent: Number(totalSpent.toFixed(2)),
-      previousSpent: Number(previousSpent.toFixed(2)),
-      alerts: buildRichAlerts(currentTransactions, previousTransactions),
-      selectedItemCount: selectedItemIds?.length || null,
-      selectedAccountCount: selectedAccountIds?.length || null,
+      ...insightData,
+      statusSummary: buildTransactionStatusSummary(currentTransactions),
+      refreshMeta: buildRefreshMeta({
+        source: "money_insights",
+        syncTriggered: false,
+        userId,
+        selectedItemIds,
+        selectedAccountIds,
+      }),
     });
   } catch (err) {
-    console.error("alerts error:", err?.response?.data || err?.message || err);
-    res.status(500).json({ error: "Failed to build alerts." });
+    console.error("money_insights error:", err?.message || err);
+    res.status(500).json({ error: "Failed to build money insights." });
   }
 });
 
@@ -2089,7 +2174,19 @@ app.get("/transactions_by_month", generalLimiter, async (req, res) => {
       selectedAccountIds
     )).filter(isDebitLikeTransaction);
 
-    res.json(buildTransactionsByMonth(transactions, startDate, endDate));
+    const monthPayload = buildTransactionsByMonth(transactions, startDate, endDate);
+
+    res.json({
+      ...monthPayload,
+      statusSummary: buildTransactionStatusSummary(transactions),
+      refreshMeta: buildRefreshMeta({
+        source: "transactions_by_month",
+        syncTriggered: false,
+        userId,
+        selectedItemIds,
+        selectedAccountIds,
+      }),
+    });
   } catch (err) {
     console.error("transactions_by_month error:", err?.response?.data || err?.message || err);
     res.status(500).json({ error: "Failed to build transactions by month." });
@@ -2137,12 +2234,16 @@ app.get("/money_insights", generalLimiter, async (req, res) => {
       sixMonthTransactions
     );
 
-    console.log("money_insights insightData keys:", Object.keys(insightData));
-
     res.json({
       ...insightData,
-      selectedItemCount: selectedItemIds?.length || null,
-      selectedAccountCount: selectedAccountIds?.length || null,
+      statusSummary: buildTransactionStatusSummary(currentTransactions),
+      refreshMeta: buildRefreshMeta({
+        source: "money_insights",
+        syncTriggered: false,
+        userId,
+        selectedItemIds,
+        selectedAccountIds,
+      }),
     });
   } catch (err) {
     console.error("money_insights error:", err?.message || err);
