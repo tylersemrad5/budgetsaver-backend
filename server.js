@@ -2138,6 +2138,48 @@ app.post("/budgets", generalLimiter, async (req, res) => {
   }
 });
 
+app.get("/alerts", generalLimiter, async (req, res) => {
+  try {
+    const ctx = await requireSelectionOrAll(req, res);
+    if (!ctx) return;
+
+    const { userId, selectedItemIds, selectedAccountIds } = ctx;
+
+    const currentRange = getDateRangeLast30Days();
+    const previousRange = getPrevious30DayRange();
+
+    const currentTransactions = (await getStoredTransactionsForUser(
+      userId,
+      currentRange.start,
+      currentRange.end,
+      selectedItemIds,
+      selectedAccountIds
+    )).filter(isDebitLikeTransaction);
+
+    const previousTransactions = (await getStoredTransactionsForUser(
+      userId,
+      previousRange.start,
+      previousRange.end,
+      selectedItemIds,
+      selectedAccountIds
+    )).filter(isDebitLikeTransaction);
+
+    res.json({
+      alerts: buildRichAlerts(currentTransactions, previousTransactions),
+      statusSummary: buildTransactionStatusSummary(currentTransactions),
+      refreshMeta: buildRefreshMeta({
+        source: "alerts",
+        userId,
+        selectedItemIds,
+        selectedAccountIds,
+      }),
+    });
+  } catch (err) {
+    console.error("alerts error:", err?.message || err);
+    res.status(500).json({ error: "Failed to build alerts." });
+  }
+});
+
 app.get("/insights", generalLimiter, async (req, res) => {
   try {
     const ctx = await requireSelectionOrAll(req, res);
