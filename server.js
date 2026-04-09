@@ -1727,6 +1727,33 @@ async function requireSelectionOrAll(req, res) {
   };
 }
 
+function buildTransactionStatusSummary(transactions) {
+  const pendingTransactions = transactions.filter(
+    (tx) => tx.pending === true || tx.status === "pending"
+  );
+
+  const postedTransactions = transactions.filter(
+    (tx) => !(tx.pending === true || tx.status === "pending")
+  );
+
+  const pendingTotal = pendingTransactions.reduce(
+    (sum, tx) => sum + Number(tx.amount || 0),
+    0
+  );
+
+  const postedTotal = postedTransactions.reduce(
+    (sum, tx) => sum + Number(tx.amount || 0),
+    0
+  );
+
+  return {
+    pendingCount: pendingTransactions.length,
+    postedCount: postedTransactions.length,
+    pendingTotal: Number(pendingTotal.toFixed(2)),
+    postedTotal: Number(postedTotal.toFixed(2)),
+  };
+}
+
 // =========================
 // Routes
 // =========================
