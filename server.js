@@ -1,4 +1,3 @@
-
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -6,10 +5,10 @@ import rateLimit from "express-rate-limit";
 import pg from "pg";
 import plaid from "plaid";
 import crypto from "node:crypto";
+import { initializeApp, getApps } from "firebase-admin/app";
+import { getAuth } from "firebase-admin/auth";
 import {
-  SignJWT,
   jwtVerify,
-  createRemoteJWKSet,
   importJWK,
   decodeProtectedHeader
 } from "jose";
@@ -23,9 +22,10 @@ const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
 
-// ---------------------------------------
+// ===========================================
+// BUDGETSAVER 2.0 ALPHA 0.3
 // Configuration
-// ---------------------------------------
+// ===========================================
 
 const PORT = Number(process.env.PORT || 3000);
 
@@ -33,8 +33,8 @@ const required = [
   "DATABASE_URL",
   "PLAID_CLIENT_ID",
   "PLAID_SECRET",
-  "APPLE_BUNDLE_ID",
-  "SESSION_SECRET",
+  "FIREBASE_PROJECT_ID",
+  "ALLOWED_FIREBASE_UID",
   "TOKEN_ENCRYPTION_KEY"
 ];
 
@@ -44,13 +44,22 @@ for (const key of required) {
   }
 }
 
-const SESSION_SECRET = new TextEncoder().encode(
-  process.env.SESSION_SECRET
-);
+// ===========================================
+// FIREBASE AUTHENTICATION
+// ===========================================
 
-if (SESSION_SECRET.length < 32) {
-  throw new Error("SESSION_SECRET must be at least 32 bytes");
+if (getApps().length === 0) {
+  initializeApp({
+    projectId: process.env.FIREBASE_PROJECT_ID
+  });
 }
+
+const firebaseAuth = getAuth();
+const allowedFirebaseUid = process.env.ALLOWED_FIREBASE_UID;
+
+// ===========================================
+// TOKEN ENCRYPTION
+// ===========================================
 
 const ENCRYPTION_KEY = Buffer.from(
   process.env.TOKEN_ENCRYPTION_KEY,
@@ -59,137 +68,9 @@ const ENCRYPTION_KEY = Buffer.from(
 
 if (ENCRYPTION_KEY.length !== 32) {
   throw new Error(
-    "TOKEN_ENCRYPTION_KEY must be 32 bytes encoded as 64 hex characters"
+    "TOKEN_ENCRYPTION_KEY must be 64 hexadecimal characters"
   );
 }
-
-const plaidEnvironment =
-  process.env.PLAID_ENV === "production"
-    ? PlaidEnvironments.production
-    : PlaidEnvironments.sandbox;
-
-const plaidClient = new PlaidApi(
-  new Configuration({
-    basePath: plaidEnvironment,
-    baseOptions: {
-      headers: {
-        "PLAID-CLIENT-ID": process.env.PLAID_CLIENT_ID,
-        "PLAID-SECRET": process.env.PLAID_SECRET,
-        "Plaid-Version": "2020-09-14"
-      }
-    }
-  })
-);
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  // Render private-network connections can use unencrypted
-  // transport within its private network. For external DBs,
-  // configure verified TLS using a trusted CA.
-  ssl: process.env.DATABASE_CA_CERT
-    ? {
-        rejectUnauthorized: true,
-        ca: process.env.DATABASE_CA_CERT.replace(/\\n/g, "\n")
-      }
-    : false,
-  max: 5,
-  connectionTimeoutMillis: 10000
-});
-
-// ---------------------------------------
-// Middleware
-// ---------------------------------------
-
-app.use((req, res, next) => {
-  res.setHeader("Cache-Control", "no-store");
-  res.setHeader("X-Content-Type-Options", "nosniff");
-  next();
-});
-
-const allowedOrigins = (
-  process.env.ALLOWED_WEB_ORIGINS || ""
-)
-  .split(",")
-  .map(value => value.trim())
-  .filter(Boolean);
-
-app.use(cors({
-  origin(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    return callback(new Error("Origin not permitted"));
-  }
-}));
-
-const limiter = rateLimit({
-  windowMs: 60 * 1000,
-  limit: 100,
-  standardHeaders: "draft-7",
-  legacyHeaders: false
-});
-
-app.use(limiter);
-
-// Plaid needs the exact raw request body for verification.
-app.use(
-  "/plaid/webhook",
-  express.raw({ type: "application/json", limit: "256kb" })
-);
-
-app.use(express.json({ limit: "256kb" }));
-
-// ---------------------------------------
-// Error handling helpers
-// ---------------------------------------
-
-function asyncRoute(fn) {
-  return (req, res, next) => {
-    Promise.resolve(fn(req, res, next)).catch(next);
-  };
-}
-
-function httpError(status, message) {
-  const error = new Error(message);
-  error.status = status;
-  return error;
-}
-
-function validAmount(value, allowZero = true) {
-  const n = Number(value);
-  if (
-    !Number.isFinite(n) ||
-    n < 0 ||
-    (!allowZero && n === 0) ||
-    n > 1000000000
-  ) {
-    throw httpError(400, "Invalid amount");
-  }
-  return Math.round(n * 100) / 100;
-}
-
-function validDate(value) {
-  if (
-    typeof value !== "string" ||
-    !/^\d{4}-\d{2}-\d{2}$/.test(value) ||
-    Number.isNaN(Date.parse(`${value}T12:00:00Z`))
-  ) {
-    throw httpError(400, "Invalid date");
-  }
-  return value;
-}
-
-function validText(value, max = 150) {
-  const result = String(value ?? "").trim();
-  if (!result || result.length > max) {
-    throw httpError(400, "Invalid text field");
-  }
-  return result;
-}
-
-// ---------------------------------------
-// Encryption
-// ---------------------------------------
 
 function encryptToken(value) {
   const iv = crypto.randomBytes(12);
@@ -226,7 +107,9 @@ function decryptToken(value) {
     Buffer.from(parts[1], "hex")
   );
 
-  decipher.setAuthTag(Buffer.from(parts[2], "hex"));
+  decipher.setAuthTag(
+    Buffer.from(parts[2], "hex")
+  );
 
   return Buffer.concat([
     decipher.update(Buffer.from(parts[3], "hex")),
@@ -234,15 +117,163 @@ function decryptToken(value) {
   ]).toString("utf8");
 }
 
-// ---------------------------------------
-// Database initialization
-// ---------------------------------------
+// ===========================================
+// PLAID CONFIGURATION
+// ===========================================
+
+const plaidEnvironment =
+  process.env.PLAID_ENV === "production"
+    ? PlaidEnvironments.production
+    : PlaidEnvironments.sandbox;
+
+const plaidClient = new PlaidApi(
+  new Configuration({
+    basePath: plaidEnvironment,
+    baseOptions: {
+      headers: {
+        "PLAID-CLIENT-ID": process.env.PLAID_CLIENT_ID,
+        "PLAID-SECRET": process.env.PLAID_SECRET,
+        "Plaid-Version": "2020-09-14"
+      }
+    }
+  })
+);
+
+// ===========================================
+// POSTGRESQL CONNECTION
+// ===========================================
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_CA_CERT
+    ? {
+        rejectUnauthorized: true,
+        ca: process.env.DATABASE_CA_CERT.replace(
+          /\\n/g,
+          "\n"
+        )
+      }
+    : false,
+  max: 5,
+  connectionTimeoutMillis: 10000
+});
+
+// ===========================================
+// EXPRESS MIDDLEWARE
+// ===========================================
+
+app.use((req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  next();
+});
+
+const allowedOrigins = (
+  process.env.ALLOWED_WEB_ORIGINS || ""
+)
+  .split(",")
+  .map(value => value.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("Origin not permitted"));
+    }
+  })
+);
+
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    limit: 100,
+    standardHeaders: "draft-7",
+    legacyHeaders: false
+  })
+);
+
+// Preserve the raw body for Plaid webhook verification.
+app.use(
+  "/plaid/webhook",
+  express.raw({
+    type: "application/json",
+    limit: "256kb"
+  })
+);
+
+app.use(
+  express.json({
+    limit: "256kb"
+  })
+);
+
+// ===========================================
+// HELPERS
+// ===========================================
+
+function asyncRoute(fn) {
+  return (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
+function httpError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+function validAmount(value, allowZero = true) {
+  const number = Number(value);
+
+  if (
+    !Number.isFinite(number) ||
+    number < 0 ||
+    (!allowZero && number === 0) ||
+    number > 1000000000
+  ) {
+    throw httpError(400, "Invalid amount");
+  }
+
+  return Math.round(number * 100) / 100;
+}
+
+function validDate(value) {
+  if (
+    typeof value !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(value) ||
+    Number.isNaN(Date.parse(`${value}T12:00:00Z`))
+  ) {
+    throw httpError(400, "Invalid date");
+  }
+
+  return value;
+}
+
+function validText(value, max = 150) {
+  const result = String(value ?? "").trim();
+
+  if (!result || result.length > max) {
+    throw httpError(400, "Invalid text field");
+  }
+
+  return result;
+}
+
+// ===========================================
+// DATABASE INITIALIZATION
+// ===========================================
 
 async function initializeDatabase() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bs_users (
       id UUID PRIMARY KEY,
-      apple_subject TEXT NOT NULL UNIQUE,
+      apple_subject TEXT UNIQUE,
+      firebase_uid TEXT UNIQUE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
@@ -341,177 +372,213 @@ async function initializeDatabase() {
     );
   `);
 
+  // Preserve the previous Apple-based schema and records.
+  // Add Firebase identity support without deleting data.
+
+  await pool.query(`
+    ALTER TABLE bs_users
+      ALTER COLUMN apple_subject DROP NOT NULL;
+
+    ALTER TABLE bs_users
+      ADD COLUMN IF NOT EXISTS firebase_uid TEXT;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS
+      bs_users_firebase_uid_idx
+      ON bs_users(firebase_uid);
+  `);
+
   console.log("BudgetSaver 2.0 database initialized");
 }
 
-// ---------------------------------------
-// Apple authentication
-// ---------------------------------------
-
-const appleKeys = createRemoteJWKSet(
-  new URL("https://appleid.apple.com/auth/keys")
-);
-
-async function issueSession(userId) {
-  return new SignJWT({ sub: userId })
-    .setProtectedHeader({ alg: "HS256" })
-    .setIssuer("budgetsaver-backend")
-    .setAudience("budgetsaver-ios")
-    .setIssuedAt()
-    .setExpirationTime("1h")
-    .sign(SESSION_SECRET);
-}
+// ===========================================
+// FIREBASE AUTHENTICATION MIDDLEWARE
+// ===========================================
 
 async function requireAuth(req, res, next) {
   try {
-    const authorization = req.get("authorization") || "";
+    const authorization =
+      req.get("authorization") || "";
 
-    if (!authorization.startsWith("Bearer ")) {
+    const match = /^Bearer ([^\s]+)$/i.exec(
+      authorization
+    );
+
+    if (!match) {
       throw httpError(401, "Authentication required");
     }
 
-    const token = authorization.slice(7);
+    // Verify Firebase's signature, project, and expiry.
+    const decoded = await firebaseAuth.verifyIdToken(
+      match[1]
+    );
 
-    const verified = await jwtVerify(token, SESSION_SECRET, {
-      issuer: "budgetsaver-backend",
-      audience: "budgetsaver-ios",
-      algorithms: ["HS256"]
-    });
-
-    req.userId = verified.payload.sub;
-
-    if (
-      typeof req.userId !== "string" ||
-      !/^[0-9a-f-]{36}$/i.test(req.userId)
-    ) {
-      throw httpError(401, "Invalid session");
+    // Only the approved private-alpha account is allowed.
+    if (decoded.uid !== allowedFirebaseUid) {
+      throw httpError(403, "Account not authorized");
     }
 
+    // Store the Firebase UID against our internal UUID.
+    // Existing financial database foreign keys use UUIDs.
+
+    const result = await pool.query(`
+      INSERT INTO bs_users (
+        id,
+        firebase_uid
+      )
+      VALUES ($1, $2)
+
+      ON CONFLICT (firebase_uid)
+      DO UPDATE SET
+        firebase_uid = EXCLUDED.firebase_uid
+
+      RETURNING id
+    `, [
+      crypto.randomUUID(),
+      decoded.uid
+    ]);
+
+    req.userId = result.rows[0].id;
+    req.firebaseUid = decoded.uid;
+
     next();
-  } catch {
-    next(httpError(401, "Invalid or expired session"));
+  } catch (error) {
+    if (error.status === 403) {
+      return next(error);
+    }
+
+    return next(
+      httpError(
+        401,
+        "Invalid or expired authentication"
+      )
+    );
   }
 }
 
-app.post("/auth/apple", asyncRoute(async (req, res) => {
-  const identityToken = req.body?.identity_token;
-
-  if (typeof identityToken !== "string") {
-    throw httpError(400, "Missing Apple identity token");
-  }
-
-  const { payload } = await jwtVerify(identityToken, appleKeys, {
-    issuer: "https://appleid.apple.com",
-    audience: process.env.APPLE_BUNDLE_ID,
-    algorithms: ["RS256"]
-  });
-
-  if (typeof payload.sub !== "string") {
-    throw httpError(401, "Invalid Apple identity");
-  }
-
-  // The native app must use a valid Apple authorization
-  // flow. A fresh, challenge-bound authentication design
-  // is required before public launch.
-  const result = await pool.query(`
-    INSERT INTO bs_users (id, apple_subject)
-    VALUES ($1, $2)
-    ON CONFLICT (apple_subject)
-    DO UPDATE SET apple_subject = EXCLUDED.apple_subject
-    RETURNING id
-  `, [crypto.randomUUID(), payload.sub]);
-
-  const userId = result.rows[0].id;
-
-  res.json({
-    token: await issueSession(userId),
-    expires_in: 3600
-  });
-}));
-
-// ---------------------------------------
-// Health
-// ---------------------------------------
+// ===========================================
+// HEALTH CHECK
+// ===========================================
 
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "BudgetSaver",
-    version: "2.0-alpha.2"
+    version: "2.0-alpha.3"
   });
 });
 
-// Everything below requires authentication,
-// except the independently verified webhook.
+// ===========================================
+// PROTECTED API ROUTER
+// ===========================================
+
 const api = express.Router();
+
 api.use(requireAuth);
 
-// ---------------------------------------
-// Plaid Link
-// ---------------------------------------
+// This route lets us verify Firebase login
+// before accessing any banking information.
 
-api.post("/plaid/link-token", asyncRoute(async (req, res) => {
-  const response = await plaidClient.linkTokenCreate({
-    client_name: "BudgetSaver",
-    language: "en",
-    country_codes: ["US"],
-    user: { client_user_id: req.userId },
-    products: ["transactions"],
-    ...(process.env.PLAID_WEBHOOK_URL
-      ? { webhook: process.env.PLAID_WEBHOOK_URL }
-      : {})
-  });
-
+api.get("/auth/me", (req, res) => {
   res.json({
-    link_token: response.data.link_token,
-    expiration: response.data.expiration
+    authenticated: true,
+    uid: req.firebaseUid
   });
-}));
+});
 
-api.post("/plaid/exchange", asyncRoute(async (req, res) => {
-  const publicToken = req.body?.public_token;
+// ===========================================
+// PLAID LINK
+// ===========================================
 
-  if (typeof publicToken !== "string") {
-    throw httpError(400, "Missing public token");
-  }
+api.post(
+  "/plaid/link-token",
+  asyncRoute(async (req, res) => {
+    const response = await plaidClient.linkTokenCreate({
+      client_name: "BudgetSaver",
+      language: "en",
+      country_codes: ["US"],
+      user: {
+        client_user_id: req.userId
+      },
+      products: ["transactions"],
+      ...(process.env.PLAID_WEBHOOK_URL
+        ? {
+            webhook: process.env.PLAID_WEBHOOK_URL
+          }
+        : {})
+    });
 
-  const response = await plaidClient.itemPublicTokenExchange({
-    public_token: publicToken
-  });
+    res.json({
+      link_token: response.data.link_token,
+      expiration: response.data.expiration
+    });
+  })
+);
 
-  const { item_id, access_token } = response.data;
+api.post(
+  "/plaid/exchange",
+  asyncRoute(async (req, res) => {
+    const publicToken = req.body?.public_token;
 
-  const encrypted = encryptToken(access_token);
+    if (typeof publicToken !== "string") {
+      throw httpError(400, "Missing public token");
+    }
 
-  await pool.query(`
-    INSERT INTO bs_items (
-      item_id, user_id, token_encrypted
-    )
-    VALUES ($1,$2,$3)
-    ON CONFLICT (item_id)
-    DO NOTHING
-  `, [item_id, req.userId, encrypted]);
+    const response =
+      await plaidClient.itemPublicTokenExchange({
+        public_token: publicToken
+      });
 
-  const item = await pool.query(`
-    SELECT user_id FROM bs_items WHERE item_id=$1
-  `, [item_id]);
+    const {
+      item_id,
+      access_token
+    } = response.data;
 
-  if (item.rows[0]?.user_id !== req.userId) {
-    throw httpError(403, "Bank item belongs to another user");
-  }
+    const encrypted = encryptToken(access_token);
 
-  res.json({
-    ok: true,
-    item_id
-  });
-}));
+    await pool.query(`
+      INSERT INTO bs_items (
+        item_id,
+        user_id,
+        token_encrypted
+      )
+      VALUES ($1, $2, $3)
 
-// ---------------------------------------
-// Account refresh
-// ---------------------------------------
+      ON CONFLICT (item_id)
+      DO NOTHING
+    `, [
+      item_id,
+      req.userId,
+      encrypted
+    ]);
+
+    const item = await pool.query(`
+      SELECT user_id
+      FROM bs_items
+      WHERE item_id = $1
+    `, [item_id]);
+
+    if (item.rows[0]?.user_id !== req.userId) {
+      throw httpError(
+        403,
+        "Bank item belongs to another user"
+      );
+    }
+
+    res.json({
+      ok: true,
+      item_id
+    });
+  })
+);
+
+// ===========================================
+// REFRESH BANK ACCOUNTS
+// ===========================================
 
 async function refreshAccounts(item) {
-  const accessToken = decryptToken(item.token_encrypted);
+  const accessToken = decryptToken(
+    item.token_encrypted
+  );
 
   const response = await plaidClient.accountsGet({
     access_token: accessToken
@@ -520,22 +587,36 @@ async function refreshAccounts(item) {
   for (const account of response.data.accounts) {
     await pool.query(`
       INSERT INTO bs_accounts (
-        account_id, item_id, user_id,
-        name, type, subtype, mask,
-        current_balance, available_balance,
+        account_id,
+        item_id,
+        user_id,
+        name,
+        type,
+        subtype,
+        mask,
+        current_balance,
+        available_balance,
         updated_at
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+      VALUES (
+        $1, $2, $3, $4, $5,
+        $6, $7, $8, $9, NOW()
+      )
+
       ON CONFLICT (account_id)
       DO UPDATE SET
-        name=EXCLUDED.name,
-        type=EXCLUDED.type,
-        subtype=EXCLUDED.subtype,
-        mask=EXCLUDED.mask,
-        current_balance=EXCLUDED.current_balance,
-        available_balance=EXCLUDED.available_balance,
-        updated_at=NOW()
-      WHERE bs_accounts.user_id=EXCLUDED.user_id
+        name = EXCLUDED.name,
+        type = EXCLUDED.type,
+        subtype = EXCLUDED.subtype,
+        mask = EXCLUDED.mask,
+        current_balance =
+          EXCLUDED.current_balance,
+        available_balance =
+          EXCLUDED.available_balance,
+        updated_at = NOW()
+
+      WHERE bs_accounts.user_id =
+        EXCLUDED.user_id
     `, [
       account.account_id,
       item.item_id,
@@ -550,46 +631,72 @@ async function refreshAccounts(item) {
   }
 }
 
-api.get("/accounts", asyncRoute(async (req, res) => {
-  const result = await pool.query(`
-    SELECT
-      account_id, item_id, name, type, subtype, mask,
-      current_balance, available_balance, updated_at
-    FROM bs_accounts
-    WHERE user_id=$1
-    ORDER BY name
-  `, [req.userId]);
+api.get(
+  "/accounts",
+  asyncRoute(async (req, res) => {
+    const result = await pool.query(`
+      SELECT
+        account_id,
+        item_id,
+        name,
+        type,
+        subtype,
+        mask,
+        current_balance,
+        available_balance,
+        updated_at
 
-  res.json({ accounts: result.rows });
-}));
+      FROM bs_accounts
+      WHERE user_id = $1
+      ORDER BY name
+    `, [req.userId]);
 
-api.post("/accounts/refresh", asyncRoute(async (req, res) => {
-  const result = await pool.query(`
-    SELECT * FROM bs_items WHERE user_id=$1
-  `, [req.userId]);
+    res.json({
+      accounts: result.rows
+    });
+  })
+);
 
-  for (const item of result.rows) {
-    await refreshAccounts(item);
-  }
+api.post(
+  "/accounts/refresh",
+  asyncRoute(async (req, res) => {
+    const result = await pool.query(`
+      SELECT *
+      FROM bs_items
+      WHERE user_id = $1
+    `, [req.userId]);
 
-  res.json({ ok: true });
-}));
+    for (const item of result.rows) {
+      await refreshAccounts(item);
+    }
 
-// ---------------------------------------
-// Transaction synchronization
-// ---------------------------------------
+    res.json({
+      ok: true
+    });
+  })
+);
+
+// ===========================================
+// TRANSACTION SYNCHRONIZATION
+// ===========================================
 
 const syncingItems = new Set();
 
 async function syncItem(item) {
   if (syncingItems.has(item.item_id)) {
-    return { skipped: true, reason: "already_syncing" };
+    return {
+      skipped: true,
+      reason: "already_syncing"
+    };
   }
 
   syncingItems.add(item.item_id);
 
   try {
-    const token = decryptToken(item.token_encrypted);
+    const token = decryptToken(
+      item.token_encrypted
+    );
+
     const originalCursor = item.cursor || null;
 
     let changes;
@@ -598,15 +705,21 @@ async function syncItem(item) {
     for (let attempt = 0; attempt < 3; attempt++) {
       let cursor = originalCursor;
       let hasMore = true;
-      const batch = { added: [], modified: [], removed: [] };
+
+      const batch = {
+        added: [],
+        modified: [],
+        removed: []
+      };
 
       try {
         while (hasMore) {
-          const response = await plaidClient.transactionsSync({
-            access_token: token,
-            cursor: cursor || undefined,
-            count: 500
-          });
+          const response =
+            await plaidClient.transactionsSync({
+              access_token: token,
+              cursor: cursor || undefined,
+              count: 500
+            });
 
           const data = response.data;
 
@@ -622,18 +735,21 @@ async function syncItem(item) {
         finalCursor = cursor;
         break;
       } catch (error) {
-        if (
+        const mutation =
           error?.response?.data?.error_code ===
-          "TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION" &&
-          attempt < 2
-        ) {
+          "TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION";
+
+        if (mutation && attempt < 2) {
           continue;
         }
+
         throw error;
       }
     }
 
-    if (!changes) throw new Error("Sync unsuccessful");
+    if (!changes) {
+      throw new Error("Sync unsuccessful");
+    }
 
     const client = await pool.connect();
 
@@ -646,20 +762,34 @@ async function syncItem(item) {
       ]) {
         await client.query(`
           INSERT INTO bs_transactions (
-            transaction_id, account_id, item_id, user_id,
-            name, merchant, amount, date, category, pending
+            transaction_id,
+            account_id,
+            item_id,
+            user_id,
+            name,
+            merchant,
+            amount,
+            date,
+            category,
+            pending
           )
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-          ON CONFLICT(transaction_id)
+          VALUES (
+            $1, $2, $3, $4, $5,
+            $6, $7, $8, $9, $10
+          )
+
+          ON CONFLICT (transaction_id)
           DO UPDATE SET
-            name=EXCLUDED.name,
-            merchant=EXCLUDED.merchant,
-            amount=EXCLUDED.amount,
-            date=EXCLUDED.date,
-            category=EXCLUDED.category,
-            pending=EXCLUDED.pending,
-            updated_at=NOW()
-          WHERE bs_transactions.user_id=EXCLUDED.user_id
+            name = EXCLUDED.name,
+            merchant = EXCLUDED.merchant,
+            amount = EXCLUDED.amount,
+            date = EXCLUDED.date,
+            category = EXCLUDED.category,
+            pending = EXCLUDED.pending,
+            updated_at = NOW()
+
+          WHERE bs_transactions.user_id =
+            EXCLUDED.user_id
         `, [
           tx.transaction_id,
           tx.account_id,
@@ -669,7 +799,8 @@ async function syncItem(item) {
           tx.merchant_name || null,
           tx.amount,
           tx.date,
-          tx.personal_finance_category?.primary || "OTHER",
+          tx.personal_finance_category?.primary ||
+            "OTHER",
           tx.pending === true
         ]);
       }
@@ -677,17 +808,30 @@ async function syncItem(item) {
       for (const tx of changes.removed) {
         await client.query(`
           DELETE FROM bs_transactions
-          WHERE transaction_id=$1 AND user_id=$2
-        `, [tx.transaction_id, item.user_id]);
+
+          WHERE transaction_id = $1
+            AND user_id = $2
+        `, [
+          tx.transaction_id,
+          item.user_id
+        ]);
       }
 
       await client.query(`
         UPDATE bs_items
-        SET cursor=$1,
-            last_synced_at=NOW(),
-            sync_error=NULL
-        WHERE item_id=$2 AND user_id=$3
-      `, [finalCursor, item.item_id, item.user_id]);
+
+        SET
+          cursor = $1,
+          last_synced_at = NOW(),
+          sync_error = NULL
+
+        WHERE item_id = $2
+          AND user_id = $3
+      `, [
+        finalCursor,
+        item.item_id,
+        item.user_id
+      ]);
 
       await client.query("COMMIT");
     } catch (error) {
@@ -706,11 +850,16 @@ async function syncItem(item) {
   } catch (error) {
     await pool.query(`
       UPDATE bs_items
-      SET sync_error=$1
-      WHERE item_id=$2 AND user_id=$3
+
+      SET sync_error = $1
+
+      WHERE item_id = $2
+        AND user_id = $3
     `, [
-      String(error?.response?.data?.error_code ||
-        "SYNC_FAILED").slice(0, 100),
+      String(
+        error?.response?.data?.error_code ||
+        "SYNC_FAILED"
+      ).slice(0, 100),
       item.item_id,
       item.user_id
     ]);
@@ -721,420 +870,693 @@ async function syncItem(item) {
   }
 }
 
-api.post("/transactions/sync", asyncRoute(async (req, res) => {
-  const result = await pool.query(`
-    SELECT * FROM bs_items WHERE user_id=$1
-  `, [req.userId]);
+api.post(
+  "/transactions/sync",
+  asyncRoute(async (req, res) => {
+    const result = await pool.query(`
+      SELECT *
+      FROM bs_items
+      WHERE user_id = $1
+    `, [req.userId]);
 
-  const results = [];
+    const results = [];
 
-  for (const item of result.rows) {
-    try {
-      results.push({
-        item_id: item.item_id,
-        ...(await syncItem(item))
-      });
-    } catch {
-      results.push({
-        item_id: item.item_id,
-        ok: false
-      });
+    for (const item of result.rows) {
+      try {
+        results.push({
+          item_id: item.item_id,
+          ...(await syncItem(item))
+        });
+      } catch {
+        results.push({
+          item_id: item.item_id,
+          ok: false
+        });
+      }
     }
-  }
 
-  res.json({ results });
-}));
+    res.json({ results });
+  })
+);
 
-api.get("/transactions", asyncRoute(async (req, res) => {
-  const result = await pool.query(`
-    SELECT
-      transaction_id AS id,
-      name, merchant, amount, date, category, pending,
-      account_id, 'plaid' AS source
-    FROM bs_transactions
-    WHERE user_id=$1
-    ORDER BY date DESC
-    LIMIT 500
-  `, [req.userId]);
+api.get(
+  "/transactions",
+  asyncRoute(async (req, res) => {
+    const plaidTransactions = await pool.query(`
+      SELECT
+        transaction_id AS id,
+        name,
+        merchant,
+        amount,
+        date,
+        category,
+        pending,
+        account_id,
+        'plaid' AS source
 
-  const manual = await pool.query(`
-    SELECT
-      id, name, NULL AS merchant, amount, date,
-      category, FALSE AS pending,
-      NULL AS account_id, 'manual' AS source
-    FROM bs_manual_transactions
-    WHERE user_id=$1
-    ORDER BY date DESC
-    LIMIT 500
-  `, [req.userId]);
+      FROM bs_transactions
+      WHERE user_id = $1
 
-  res.json({
-    transactions: [...result.rows, ...manual.rows]
-      .sort((a, b) =>
-        String(b.date).localeCompare(String(a.date))
+      ORDER BY date DESC
+      LIMIT 500
+    `, [req.userId]);
+
+    const manualTransactions = await pool.query(`
+      SELECT
+        id,
+        name,
+        NULL AS merchant,
+        amount,
+        date,
+        category,
+        FALSE AS pending,
+        NULL AS account_id,
+        'manual' AS source
+
+      FROM bs_manual_transactions
+      WHERE user_id = $1
+
+      ORDER BY date DESC
+      LIMIT 500
+    `, [req.userId]);
+
+    const transactions = [
+      ...plaidTransactions.rows,
+      ...manualTransactions.rows
+    ].sort((a, b) =>
+      String(b.date).localeCompare(String(a.date))
+    );
+
+    res.json({ transactions });
+  })
+);
+
+// ===========================================
+// MANUAL TRANSACTIONS
+// ===========================================
+
+api.post(
+  "/transactions/manual",
+  asyncRoute(async (req, res) => {
+    const id = crypto.randomUUID();
+
+    const name = validText(req.body.name);
+    const amount = Number(req.body.amount);
+    const date = validDate(req.body.date);
+    const category = validText(
+      req.body.category,
+      80
+    );
+
+    if (
+      !Number.isFinite(amount) ||
+      Math.abs(amount) > 1000000000
+    ) {
+      throw httpError(400, "Invalid amount");
+    }
+
+    await pool.query(`
+      INSERT INTO bs_manual_transactions (
+        id,
+        user_id,
+        name,
+        amount,
+        date,
+        category
       )
-  });
-}));
+      VALUES ($1, $2, $3, $4, $5, $6)
+    `, [
+      id,
+      req.userId,
+      name,
+      amount,
+      date,
+      category
+    ]);
 
-api.post("/transactions/manual", asyncRoute(async (req, res) => {
-  const id = crypto.randomUUID();
-  const name = validText(req.body.name);
-  const amount = Number(req.body.amount);
-  const date = validDate(req.body.date);
-  const category = validText(req.body.category, 80);
+    res.status(201).json({ id });
+  })
+);
 
-  if (!Number.isFinite(amount) || Math.abs(amount) > 1000000000) {
-    throw httpError(400, "Invalid amount");
-  }
+api.delete(
+  "/transactions/manual/:id",
+  asyncRoute(async (req, res) => {
+    await pool.query(`
+      DELETE FROM bs_manual_transactions
 
-  await pool.query(`
-    INSERT INTO bs_manual_transactions
-    (id,user_id,name,amount,date,category)
-    VALUES ($1,$2,$3,$4,$5,$6)
-  `, [id, req.userId, name, amount, date, category]);
+      WHERE id = $1
+        AND user_id = $2
+    `, [
+      req.params.id,
+      req.userId
+    ]);
 
-  res.status(201).json({ id });
-}));
+    res.json({ ok: true });
+  })
+);
 
-api.delete("/transactions/manual/:id", asyncRoute(async (req, res) => {
-  await pool.query(`
-    DELETE FROM bs_manual_transactions
-    WHERE id=$1 AND user_id=$2
-  `, [req.params.id, req.userId]);
+// ===========================================
+// MONTHLY BUDGETS
+// ===========================================
 
-  res.json({ ok: true });
-}));
+api.get(
+  "/budgets",
+  asyncRoute(async (req, res) => {
+    const month = String(req.query.month || "");
 
-// ---------------------------------------
-// Budgets
-// ---------------------------------------
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
+      throw httpError(
+        400,
+        "Invalid budget month"
+      );
+    }
 
-api.get("/budgets", asyncRoute(async (req, res) => {
-  const month = String(req.query.month || "");
+    const result = await pool.query(`
+      SELECT
+        category,
+        amount
 
-  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
-    throw httpError(400, "Invalid budget month");
-  }
+      FROM bs_budgets
 
-  const result = await pool.query(`
-    SELECT category, amount
-    FROM bs_budgets
-    WHERE user_id=$1 AND month_key=$2
-    ORDER BY category
-  `, [req.userId, month]);
+      WHERE user_id = $1
+        AND month_key = $2
 
-  res.json({ month, budgets: result.rows });
-}));
+      ORDER BY category
+    `, [
+      req.userId,
+      month
+    ]);
 
-api.put("/budgets", asyncRoute(async (req, res) => {
-  const month = String(req.body.month || "");
-  const budgets = req.body.budgets;
+    res.json({
+      month,
+      budgets: result.rows
+    });
+  })
+);
 
-  if (
-    !/^\d{4}-(0[1-9]|1[0-2])$/.test(month) ||
-    !Array.isArray(budgets) ||
-    budgets.length > 100
-  ) {
-    throw httpError(400, "Invalid budgets");
-  }
+api.put(
+  "/budgets",
+  asyncRoute(async (req, res) => {
+    const month = String(req.body.month || "");
+    const budgets = req.body.budgets;
 
-  const entries = budgets.map(item => ({
-    category: validText(item.category, 80),
-    amount: validAmount(item.amount)
-  }));
+    if (
+      !/^\d{4}-(0[1-9]|1[0-2])$/.test(month) ||
+      !Array.isArray(budgets) ||
+      budgets.length > 100
+    ) {
+      throw httpError(
+        400,
+        "Invalid budgets"
+      );
+    }
 
-  if (new Set(entries.map(x => x.category)).size !== entries.length) {
-    throw httpError(400, "Duplicate budget category");
-  }
+    const entries = budgets.map(item => ({
+      category: validText(item.category, 80),
+      amount: validAmount(item.amount)
+    }));
 
-  const client = await pool.connect();
+    if (
+      new Set(
+        entries.map(item => item.category)
+      ).size !== entries.length
+    ) {
+      throw httpError(
+        400,
+        "Duplicate budget category"
+      );
+    }
 
-  try {
-    await client.query("BEGIN");
+    const client = await pool.connect();
 
-    await client.query(`
-      DELETE FROM bs_budgets
-      WHERE user_id=$1 AND month_key=$2
-    `, [req.userId, month]);
+    try {
+      await client.query("BEGIN");
 
-    for (const entry of entries) {
       await client.query(`
-        INSERT INTO bs_budgets
-        (user_id,month_key,category,amount)
-        VALUES ($1,$2,$3,$4)
-      `, [req.userId, month, entry.category, entry.amount]);
+        DELETE FROM bs_budgets
+
+        WHERE user_id = $1
+          AND month_key = $2
+      `, [
+        req.userId,
+        month
+      ]);
+
+      for (const entry of entries) {
+        await client.query(`
+          INSERT INTO bs_budgets (
+            user_id,
+            month_key,
+            category,
+            amount
+          )
+          VALUES ($1, $2, $3, $4)
+        `, [
+          req.userId,
+          month,
+          entry.category,
+          entry.amount
+        ]);
+      }
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
     }
 
-    await client.query("COMMIT");
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
-  } finally {
-    client.release();
-  }
+    res.json({ ok: true });
+  })
+);
 
-  res.json({ ok: true });
-}));
+// ===========================================
+// BILLS
+// ===========================================
 
-// ---------------------------------------
-// Bills and goals
-// ---------------------------------------
+api.get(
+  "/bills",
+  asyncRoute(async (req, res) => {
+    const result = await pool.query(`
+      SELECT *
+      FROM bs_bills
 
-api.get("/bills", asyncRoute(async (req, res) => {
-  const result = await pool.query(`
-    SELECT * FROM bs_bills
-    WHERE user_id=$1 ORDER BY due_date
-  `, [req.userId]);
+      WHERE user_id = $1
 
-  res.json({ bills: result.rows });
-}));
+      ORDER BY due_date
+    `, [req.userId]);
 
-api.post("/bills", asyncRoute(async (req, res) => {
-  const id = crypto.randomUUID();
+    res.json({
+      bills: result.rows
+    });
+  })
+);
 
-  await pool.query(`
-    INSERT INTO bs_bills
-      (id,user_id,name,amount,due_date)
-    VALUES ($1,$2,$3,$4,$5)
-  `, [
-    id,
-    req.userId,
-    validText(req.body.name),
-    validAmount(req.body.amount, false),
-    validDate(req.body.due_date)
-  ]);
+api.post(
+  "/bills",
+  asyncRoute(async (req, res) => {
+    const id = crypto.randomUUID();
 
-  res.status(201).json({ id });
-}));
+    await pool.query(`
+      INSERT INTO bs_bills (
+        id,
+        user_id,
+        name,
+        amount,
+        due_date
+      )
+      VALUES ($1, $2, $3, $4, $5)
+    `, [
+      id,
+      req.userId,
+      validText(req.body.name),
+      validAmount(req.body.amount, false),
+      validDate(req.body.due_date)
+    ]);
 
-api.patch("/bills/:id", asyncRoute(async (req, res) => {
-  if (typeof req.body.paid !== "boolean") {
-    throw httpError(400, "Invalid paid status");
-  }
+    res.status(201).json({ id });
+  })
+);
 
-  await pool.query(`
-    UPDATE bs_bills SET paid=$1
-    WHERE id=$2 AND user_id=$3
-  `, [req.body.paid, req.params.id, req.userId]);
-
-  res.json({ ok: true });
-}));
-
-api.get("/goals", asyncRoute(async (req, res) => {
-  const result = await pool.query(`
-    SELECT * FROM bs_goals
-    WHERE user_id=$1 ORDER BY name
-  `, [req.userId]);
-
-  res.json({ goals: result.rows });
-}));
-
-api.post("/goals", asyncRoute(async (req, res) => {
-  const id = crypto.randomUUID();
-
-  await pool.query(`
-    INSERT INTO bs_goals
-    (id,user_id,name,target,progress,is_debt)
-    VALUES ($1,$2,$3,$4,$5,$6)
-  `, [
-    id,
-    req.userId,
-    validText(req.body.name),
-    validAmount(req.body.target, false),
-    validAmount(req.body.progress ?? 0),
-    req.body.is_debt === true
-  ]);
-
-  res.status(201).json({ id });
-}));
-
-// ---------------------------------------
-// User preferences and planning
-// ---------------------------------------
-
-api.get("/preferences", asyncRoute(async (req, res) => {
-  const result = await pool.query(`
-    SELECT * FROM bs_preferences WHERE user_id=$1
-  `, [req.userId]);
-
-  res.json({
-    preferences: result.rows[0] || {
-      checking_reserve: "200.00",
-      planned_spending: "0.00",
-      planned_debt: "0.00",
-      planned_savings: "0.00"
+api.patch(
+  "/bills/:id",
+  asyncRoute(async (req, res) => {
+    if (typeof req.body.paid !== "boolean") {
+      throw httpError(
+        400,
+        "Invalid paid status"
+      );
     }
-  });
-}));
 
-api.put("/preferences", asyncRoute(async (req, res) => {
-  const reserve = validAmount(req.body.checking_reserve);
-  const spending = validAmount(req.body.planned_spending);
-  const debt = validAmount(req.body.planned_debt);
-  const savings = validAmount(req.body.planned_savings);
+    await pool.query(`
+      UPDATE bs_bills
 
-  await pool.query(`
-    INSERT INTO bs_preferences (
-      user_id, checking_reserve,
-      planned_spending, planned_debt, planned_savings
-    )
-    VALUES ($1,$2,$3,$4,$5)
-    ON CONFLICT(user_id)
-    DO UPDATE SET
-      checking_reserve=EXCLUDED.checking_reserve,
-      planned_spending=EXCLUDED.planned_spending,
-      planned_debt=EXCLUDED.planned_debt,
-      planned_savings=EXCLUDED.planned_savings,
-      updated_at=NOW()
-  `, [req.userId, reserve, spending, debt, savings]);
+      SET paid = $1
 
-  res.json({ ok: true });
-}));
+      WHERE id = $2
+        AND user_id = $3
+    `, [
+      req.body.paid,
+      req.params.id,
+      req.userId
+    ]);
 
-// ---------------------------------------
-// Sync health
-// ---------------------------------------
+    res.json({ ok: true });
+  })
+);
 
-api.get("/sync-health", asyncRoute(async (req, res) => {
-  const result = await pool.query(`
-    SELECT
-      item_id, institution_name, last_synced_at,
-      sync_error
-    FROM bs_items
-    WHERE user_id=$1
-  `, [req.userId]);
+// ===========================================
+// FINANCIAL GOALS
+// ===========================================
 
-  res.json({
-    items: result.rows.map(item => ({
+api.get(
+  "/goals",
+  asyncRoute(async (req, res) => {
+    const result = await pool.query(`
+      SELECT *
+      FROM bs_goals
+
+      WHERE user_id = $1
+
+      ORDER BY name
+    `, [req.userId]);
+
+    res.json({
+      goals: result.rows
+    });
+  })
+);
+
+api.post(
+  "/goals",
+  asyncRoute(async (req, res) => {
+    const id = crypto.randomUUID();
+
+    await pool.query(`
+      INSERT INTO bs_goals (
+        id,
+        user_id,
+        name,
+        target,
+        progress,
+        is_debt
+      )
+      VALUES ($1, $2, $3, $4, $5, $6)
+    `, [
+      id,
+      req.userId,
+      validText(req.body.name),
+      validAmount(req.body.target, false),
+      validAmount(req.body.progress ?? 0),
+      req.body.is_debt === true
+    ]);
+
+    res.status(201).json({ id });
+  })
+);
+
+// ===========================================
+// USER PREFERENCES
+// ===========================================
+
+api.get(
+  "/preferences",
+  asyncRoute(async (req, res) => {
+    const result = await pool.query(`
+      SELECT *
+      FROM bs_preferences
+
+      WHERE user_id = $1
+    `, [req.userId]);
+
+    res.json({
+      preferences: result.rows[0] || {
+        checking_reserve: "200.00",
+        planned_spending: "0.00",
+        planned_debt: "0.00",
+        planned_savings: "0.00"
+      }
+    });
+  })
+);
+
+api.put(
+  "/preferences",
+  asyncRoute(async (req, res) => {
+    const reserve = validAmount(
+      req.body.checking_reserve
+    );
+
+    const spending = validAmount(
+      req.body.planned_spending
+    );
+
+    const debt = validAmount(
+      req.body.planned_debt
+    );
+
+    const savings = validAmount(
+      req.body.planned_savings
+    );
+
+    await pool.query(`
+      INSERT INTO bs_preferences (
+        user_id,
+        checking_reserve,
+        planned_spending,
+        planned_debt,
+        planned_savings
+      )
+      VALUES ($1, $2, $3, $4, $5)
+
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        checking_reserve =
+          EXCLUDED.checking_reserve,
+        planned_spending =
+          EXCLUDED.planned_spending,
+        planned_debt =
+          EXCLUDED.planned_debt,
+        planned_savings =
+          EXCLUDED.planned_savings,
+        updated_at = NOW()
+    `, [
+      req.userId,
+      reserve,
+      spending,
+      debt,
+      savings
+    ]);
+
+    res.json({ ok: true });
+  })
+);
+
+// ===========================================
+// FINANCIAL SYNC HEALTH
+// ===========================================
+
+api.get(
+  "/sync-health",
+  asyncRoute(async (req, res) => {
+    const result = await pool.query(`
+      SELECT
+        item_id,
+        institution_name,
+        last_synced_at,
+        sync_error
+
+      FROM bs_items
+
+      WHERE user_id = $1
+    `, [req.userId]);
+
+    const items = result.rows.map(item => ({
       ...item,
       status: item.sync_error
         ? "error"
         : item.last_synced_at
         ? "synced"
         : "not_yet_synced"
-    }))
-  });
-}));
+    }));
 
-// ---------------------------------------
-// Disconnect bank
-// ---------------------------------------
+    res.json({ items });
+  })
+);
 
-api.post("/plaid/disconnect", asyncRoute(async (req, res) => {
-  const itemId = validText(req.body.item_id, 200);
+// ===========================================
+// DISCONNECT PLAID BANK
+// ===========================================
 
-  const result = await pool.query(`
-    SELECT * FROM bs_items
-    WHERE item_id=$1 AND user_id=$2
-  `, [itemId, req.userId]);
+api.post(
+  "/plaid/disconnect",
+  asyncRoute(async (req, res) => {
+    const itemId = validText(
+      req.body.item_id,
+      200
+    );
 
-  const item = result.rows[0];
+    const result = await pool.query(`
+      SELECT *
+      FROM bs_items
 
-  if (!item) {
-    throw httpError(404, "Bank connection not found");
-  }
+      WHERE item_id = $1
+        AND user_id = $2
+    `, [
+      itemId,
+      req.userId
+    ]);
 
-  await plaidClient.itemRemove({
-    access_token: decryptToken(item.token_encrypted)
-  });
+    const item = result.rows[0];
 
-  await pool.query(`
-    DELETE FROM bs_items
-    WHERE item_id=$1 AND user_id=$2
-  `, [itemId, req.userId]);
+    if (!item) {
+      throw httpError(
+        404,
+        "Bank connection not found"
+      );
+    }
 
-  res.json({ ok: true });
-}));
+    await plaidClient.itemRemove({
+      access_token: decryptToken(
+        item.token_encrypted
+      )
+    });
 
+    await pool.query(`
+      DELETE FROM bs_items
+
+      WHERE item_id = $1
+        AND user_id = $2
+    `, [
+      itemId,
+      req.userId
+    ]);
+
+    res.json({ ok: true });
+  })
+);
+
+// All the API routes above require Firebase authentication.
 app.use("/api", api);
 
-// ---------------------------------------
-// Verified Plaid webhooks
-// ---------------------------------------
+// ===========================================
+// PLAID WEBHOOK VERIFICATION
+// ===========================================
 
-app.post("/plaid/webhook", asyncRoute(async (req, res) => {
-  const signedJWT = req.get("plaid-verification");
+app.post(
+  "/plaid/webhook",
+  asyncRoute(async (req, res) => {
+    const signedJWT = req.get(
+      "plaid-verification"
+    );
 
-  if (!signedJWT || !Buffer.isBuffer(req.body)) {
-    throw httpError(401, "Invalid webhook");
-  }
-
-  const header = decodeProtectedHeader(signedJWT);
-
-  if (
-    header.alg !== "ES256" ||
-    typeof header.kid !== "string"
-  ) {
-    throw httpError(401, "Invalid webhook signature");
-  }
-
-  const response = await plaidClient.webhookVerificationKeyGet({
-    key_id: header.kid
-  });
-
-  const jwk = response.data.key;
-
-  if (
-    jwk.kid !== header.kid ||
-    jwk.alg !== "ES256"
-  ) {
-    throw httpError(401, "Invalid verification key");
-  }
-
-  const key = await importJWK(jwk, "ES256");
-
-  const { payload } = await jwtVerify(signedJWT, key, {
-    algorithms: ["ES256"],
-    maxTokenAge: "5 min",
-    clockTolerance: "30s"
-  });
-
-  const actualHash = crypto
-    .createHash("sha256")
-    .update(req.body)
-    .digest();
-
-  if (
-    typeof payload.request_body_sha256 !== "string" ||
-    !/^[a-f0-9]{64}$/i.test(payload.request_body_sha256)
-  ) {
-    throw httpError(401, "Invalid body hash");
-  }
-
-  const expectedHash = Buffer.from(
-    payload.request_body_sha256,
-    "hex"
-  );
-
-  if (!crypto.timingSafeEqual(actualHash, expectedHash)) {
-    throw httpError(401, "Webhook body mismatch");
-  }
-
-  const body = JSON.parse(req.body.toString("utf8"));
-
-  if (
-    body.webhook_type === "TRANSACTIONS" &&
-    body.webhook_code === "SYNC_UPDATES_AVAILABLE" &&
-    typeof body.item_id === "string"
-  ) {
-    const result = await pool.query(`
-      SELECT * FROM bs_items WHERE item_id=$1
-    `, [body.item_id]);
-
-    if (result.rows[0]) {
-      await syncItem(result.rows[0]);
+    if (
+      !signedJWT ||
+      !Buffer.isBuffer(req.body)
+    ) {
+      throw httpError(
+        401,
+        "Invalid webhook"
+      );
     }
-  }
 
-  res.json({ received: true });
-}));
+    const header = decodeProtectedHeader(
+      signedJWT
+    );
 
-// ---------------------------------------
-// Unknown routes and error handler
-// ---------------------------------------
+    if (
+      header.alg !== "ES256" ||
+      typeof header.kid !== "string"
+    ) {
+      throw httpError(
+        401,
+        "Invalid webhook signature"
+      );
+    }
+
+    const response =
+      await plaidClient.webhookVerificationKeyGet({
+        key_id: header.kid
+      });
+
+    const jwk = response.data.key;
+
+    if (
+      jwk.kid !== header.kid ||
+      jwk.alg !== "ES256"
+    ) {
+      throw httpError(
+        401,
+        "Invalid verification key"
+      );
+    }
+
+    const key = await importJWK(
+      jwk,
+      "ES256"
+    );
+
+    const { payload } = await jwtVerify(
+      signedJWT,
+      key,
+      {
+        algorithms: ["ES256"],
+        maxTokenAge: "5 min",
+        clockTolerance: "30s"
+      }
+    );
+
+    const actualHash = crypto
+      .createHash("sha256")
+      .update(req.body)
+      .digest();
+
+    if (
+      typeof payload.request_body_sha256 !==
+        "string" ||
+      !/^[a-f0-9]{64}$/i.test(
+        payload.request_body_sha256
+      )
+    ) {
+      throw httpError(
+        401,
+        "Invalid body hash"
+      );
+    }
+
+    const expectedHash = Buffer.from(
+      payload.request_body_sha256,
+      "hex"
+    );
+
+    if (
+      !crypto.timingSafeEqual(
+        actualHash,
+        expectedHash
+      )
+    ) {
+      throw httpError(
+        401,
+        "Webhook body mismatch"
+      );
+    }
+
+    const body = JSON.parse(
+      req.body.toString("utf8")
+    );
+
+    if (
+      body.webhook_type === "TRANSACTIONS" &&
+      body.webhook_code === "SYNC_UPDATES_AVAILABLE" &&
+      typeof body.item_id === "string"
+    ) {
+      const result = await pool.query(`
+        SELECT *
+        FROM bs_items
+
+        WHERE item_id = $1
+      `, [body.item_id]);
+
+      if (result.rows[0]) {
+        await syncItem(result.rows[0]);
+      }
+    }
+
+    res.json({
+      received: true
+    });
+  })
+);
+
+// ===========================================
+// ERROR HANDLING
+// ===========================================
 
 app.use((_req, res) => {
-  res.status(404).json({ error: "Not found" });
+  res.status(404).json({
+    error: "Not found"
+  });
 });
 
 app.use((err, req, res, _next) => {
@@ -1143,10 +1565,13 @@ app.use((err, req, res, _next) => {
     : 500;
 
   if (status >= 500) {
-    console.error("Server operation failed", {
-      path: req.path,
-      type: err.name
-    });
+    console.error(
+      "Server operation failed",
+      {
+        path: req.path,
+        type: err.name
+      }
+    );
   }
 
   res.status(status).json({
@@ -1157,9 +1582,9 @@ app.use((err, req, res, _next) => {
   });
 });
 
-// ---------------------------------------
-// Startup
-// ---------------------------------------
+// ===========================================
+// START SERVER
+// ===========================================
 
 async function start() {
   await initializeDatabase();
@@ -1172,6 +1597,10 @@ async function start() {
 }
 
 start().catch(error => {
-  console.error("Backend startup failed:", error.message);
+  console.error(
+    "Backend startup failed:",
+    error.message
+  );
+
   process.exit(1);
 });
