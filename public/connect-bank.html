@@ -2,10 +2,11 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
 
-  <title>BudgetSaver | Connect Bank</title>
+  <title>BudgetSaver | Connect USAA</title>
 
   <style>
     * {
@@ -16,49 +17,49 @@
       margin: 0;
       min-height: 100vh;
       padding: 24px;
-      background: #f4f6fa;
-      color: #162033;
       font-family: -apple-system, BlinkMacSystemFont,
         "Segoe UI", sans-serif;
+      background: #f4f6fa;
+      color: #172033;
     }
 
     main {
-      max-width: 470px;
-      margin: 7vh auto;
+      max-width: 480px;
+      margin: 6vh auto;
       padding: 28px;
+      border-radius: 24px;
       background: white;
-      border-radius: 22px;
-      box-shadow: 0 12px 40px #16203312;
+      box-shadow: 0 12px 40px #17203312;
     }
 
     h1 {
-      margin: 0 0 8px;
       font-size: 32px;
+      margin: 0 0 6px;
     }
 
     h2 {
-      margin-top: 26px;
       font-size: 22px;
+      margin: 24px 0 10px;
     }
 
     p {
-      color: #58667c;
-      line-height: 1.55;
+      color: #5c6678;
+      line-height: 1.5;
     }
 
     label {
       display: block;
-      margin-top: 16px;
       font-size: 14px;
       font-weight: 600;
+      margin-top: 16px;
     }
 
     input,
     button {
       width: 100%;
-      min-height: 46px;
-      margin-top: 11px;
+      min-height: 48px;
       padding: 12px 14px;
+      margin-top: 11px;
       border-radius: 12px;
       font: inherit;
     }
@@ -71,17 +72,17 @@
       border: none;
       background: #2563eb;
       color: white;
-      cursor: pointer;
       font-weight: 600;
+      cursor: pointer;
     }
 
     button:disabled {
-      opacity: 0.55;
+      opacity: 0.5;
       cursor: not-allowed;
     }
 
-    button.secondary {
-      background: #eef2f8;
+    .secondary {
+      background: #edf2f8;
       color: #172033;
     }
 
@@ -91,23 +92,24 @@
 
     .notice {
       padding: 14px;
-      background: #eff5ff;
+      background: #edf5ff;
       border-radius: 12px;
-      font-size: 14px;
       line-height: 1.5;
+      font-size: 14px;
     }
 
     .warning {
-      background: #fff4e5;
+      background: #fff3df;
     }
 
     .account {
-      padding: 13px 0;
+      padding: 15px 0;
       border-bottom: 1px solid #e5e7eb;
     }
 
     .account strong {
       display: block;
+      margin-bottom: 4px;
     }
 
     .account span {
@@ -117,13 +119,8 @@
       margin-top: 4px;
     }
 
-    .muted {
-      color: #64748b;
-      font-size: 13px;
-    }
-
-    #status {
-      margin-top: 20px;
+    #status,
+    #connectionStatus {
       overflow-wrap: anywhere;
       font-size: 14px;
       line-height: 1.5;
@@ -134,7 +131,7 @@
 <body>
   <main>
     <h1>BudgetSaver</h1>
-    <p>Secure financial account connections</p>
+    <p>Private banking connection</p>
 
     <section id="login">
       <h2>Sign in</h2>
@@ -163,30 +160,34 @@
     </section>
 
     <section id="bank" class="hidden">
-      <h2>Bank Connections</h2>
-
-      <p>
-        Your BudgetSaver account is authenticated.
-      </p>
+      <h2>Connect a Bank</h2>
 
       <div id="modeNotice" class="notice">
-        Checking Plaid connection status...
+        Checking banking connection availability...
       </div>
 
       <button id="connect" disabled>
-        Connect Test Bank
+        Connect USAA
       </button>
 
+      <div id="connectionStatus"></div>
+
+      <button id="checkStatus" class="secondary">
+        Check Connection Status
+      </button>
+
+      <h2>Connected Accounts</h2>
+
       <button id="refresh" class="secondary">
-        Refresh Accounts
+        Refresh Account Balances
       </button>
 
       <button id="sync" class="secondary">
-        Sync Transactions
+        Synchronize Transactions
       </button>
 
       <div id="accounts"></div>
-      <div id="syncResult" class="muted"></div>
+      <div id="transactionSummary"></div>
 
       <button id="signOut" class="secondary">
         Sign Out
@@ -194,13 +195,9 @@
     </section>
 
     <p id="status" role="status" aria-live="polite">
-      Initializing secure authentication...
+      Loading authentication...
     </p>
   </main>
-
-  <script
-    src="https://cdn.plaid.com/link/v2/stable/link-initialize.js">
-  </script>
 
   <script type="module">
     import {
@@ -235,64 +232,51 @@
     const bankSection =
       document.getElementById("bank");
 
+    const statusElement =
+      document.getElementById("status");
+
+    const modeNotice =
+      document.getElementById("modeNotice");
+
     const connectButton =
       document.getElementById("connect");
 
-    const refreshButton =
-      document.getElementById("refresh");
-
-    const syncButton =
-      document.getElementById("sync");
-
-    const notice =
-      document.getElementById("modeNotice");
+    const connectionStatus =
+      document.getElementById("connectionStatus");
 
     const accountsElement =
       document.getElementById("accounts");
 
-    const statusElement =
-      document.getElementById("status");
-
-    const syncResultElement =
-      document.getElementById("syncResult");
+    const transactionSummary =
+      document.getElementById("transactionSummary");
 
     let currentUser = null;
     let verified = false;
-    let sandboxEnabled = false;
-    let activeSessionId = null;
-    let currentHandler = null;
-    let startupCompleted = false;
+    let linkingEnabled = false;
+    let currentSessionId = null;
 
-    const isOAuthReturn =
-      window.location.pathname === "/plaid/oauth";
+    let refreshTimer = null;
 
     function setStatus(message) {
       statusElement.textContent = message;
     }
 
-    function clearSession() {
-      sessionStorage.removeItem(
-        "bs_link_session_id"
-      );
-
-      activeSessionId = null;
+    function setConnectionStatus(message) {
+      connectionStatus.textContent = message;
     }
 
-    async function apiRequest(path, options = {}) {
+    async function api(path, options = {}) {
       if (!currentUser) {
-        throw new Error(
-          "Please sign in before continuing."
-        );
+        throw new Error("Please sign in first.");
       }
 
-      const idToken =
-        await currentUser.getIdToken();
+      const token = await currentUser.getIdToken();
 
       const response = await fetch(path, {
         ...options,
         cache: "no-store",
         headers: {
-          Authorization: "Bearer " + idToken,
+          Authorization: "Bearer " + token,
           "Content-Type": "application/json",
           ...(options.headers || {})
         }
@@ -304,149 +288,306 @@
         data = await response.json();
       } catch {
         throw new Error(
-          "BudgetSaver returned an invalid response."
+          "Invalid response from BudgetSaver."
         );
       }
 
       if (!response.ok) {
         throw new Error(
-          data.error || "Request failed."
+          data.error || "Request failed"
         );
       }
 
       return data;
     }
 
-    async function verifyAccount() {
-      const response =
-        await apiRequest("/api/auth/me");
+    function stopChecking() {
+      if (refreshTimer) {
+        clearInterval(refreshTimer);
+        refreshTimer = null;
+      }
+    }
+
+    async function verifyLogin() {
+      const response = await api("/api/auth/me");
 
       if (response.authenticated !== true) {
-        throw new Error(
-          "Your account is not authorized."
-        );
+        throw new Error("Account not authorized.");
       }
     }
 
     async function loadPlaidStatus() {
-      const result =
-        await apiRequest("/api/plaid/status");
+      const response = await api(
+        "/api/plaid/status"
+      );
 
-      sandboxEnabled =
-        result.mode === "sandbox" &&
-        result.linking_enabled === true;
+      linkingEnabled =
+        response.linking_enabled === true &&
+        response.hosted_link === true;
 
-      if (sandboxEnabled) {
-        notice.classList.remove("warning");
-        notice.textContent =
-          "Plaid Sandbox mode is enabled. " +
-          "Only fictional test accounts may be connected.";
+      if (!linkingEnabled) {
+        modeNotice.classList.add("warning");
 
-        connectButton.textContent =
-          "Connect Test Bank";
-        connectButton.disabled = false;
-      } else {
-        notice.classList.add("warning");
+        modeNotice.textContent =
+          "Plaid Production is configured, but " +
+          "the live USAA connection is locked " +
+          "until the security checks are approved.";
 
-        if (result.environment === "production") {
-          notice.textContent =
-            "Plaid Production is configured, but live " +
-            "bank linking is locked until required " +
-            "security checks are complete.";
-        } else {
-          notice.textContent =
-            "Plaid Sandbox linking is currently disabled.";
-        }
-
-        connectButton.textContent =
-          "Bank Linking Not Yet Available";
         connectButton.disabled = true;
+        connectButton.textContent =
+          "Bank Connection Not Available";
+      } else {
+        modeNotice.classList.remove("warning");
+
+        modeNotice.textContent =
+          response.environment === "production"
+            ? "Real bank connection enabled. " +
+              "Plaid will handle USAA authorization."
+            : "Plaid Sandbox testing is enabled.";
+
+        connectButton.disabled = false;
+        connectButton.textContent =
+          response.environment === "production"
+            ? "Connect USAA"
+            : "Connect Test Bank";
       }
     }
 
-    function showAccounts(accounts) {
-      accountsElement.replaceChildren();
+    async function checkConnection() {
+      if (!verified) return;
 
-      const heading = document.createElement("h3");
-      heading.textContent = "Connected Accounts";
-      accountsElement.appendChild(heading);
+      try {
+        let sessionId = currentSessionId;
+
+        if (!sessionId) {
+          const latest = await api(
+            "/api/plaid/hosted/latest"
+          );
+
+          sessionId = latest.session?.id;
+
+          if (!sessionId) {
+            setConnectionStatus(
+              "No recent bank connection attempt."
+            );
+            return;
+          }
+
+          currentSessionId = sessionId;
+        }
+
+        const result = await api(
+          "/api/plaid/hosted/status?session_id=" +
+          encodeURIComponent(sessionId)
+        );
+
+        const session = result.session;
+
+        if (session.status === "complete") {
+          stopChecking();
+
+          setConnectionStatus(
+            "Bank connection completed successfully."
+          );
+
+          await loadAccounts();
+          await syncTransactions();
+        } else if (session.status === "error") {
+          stopChecking();
+
+          setConnectionStatus(
+            "The bank connection could not be completed."
+          );
+        } else if (session.status === "processing") {
+          setConnectionStatus(
+            "Plaid authorization received. " +
+            "Saving the connection..."
+          );
+        } else {
+          setConnectionStatus(
+            "Waiting for bank authorization to finish..."
+          );
+        }
+      } catch (error) {
+        setConnectionStatus(error.message);
+      }
+    }
+
+    function startChecking() {
+      stopChecking();
+
+      refreshTimer = setInterval(() => {
+        if (
+          verified &&
+          !document.hidden
+        ) {
+          checkConnection();
+        }
+      }, 5000);
+    }
+
+    async function connectBank() {
+      if (!verified || !linkingEnabled) {
+        return;
+      }
+
+      connectButton.disabled = true;
+
+      try {
+        setConnectionStatus(
+          "Preparing secure Plaid connection..."
+        );
+
+        const popup = window.open(
+          "about:blank",
+          "_blank"
+        );
+
+        if (!popup) {
+          throw new Error(
+            "Safari blocked the banking tab. " +
+            "Allow pop-ups and try again."
+          );
+        }
+
+        try {
+          const result = await api(
+            "/api/plaid/hosted/start",
+            {
+              method: "POST",
+              body: "{}"
+            }
+          );
+
+          currentSessionId = result.session_id;
+
+          const url = new URL(
+            result.hosted_link_url
+          );
+
+          if (
+            url.protocol !== "https:" ||
+            url.hostname !== "secure.plaid.com"
+          ) {
+            throw new Error(
+              "Unexpected Plaid URL"
+            );
+          }
+
+          popup.location.replace(url.href);
+
+          setConnectionStatus(
+            "Plaid opened in a new tab. " +
+            "Complete USAA authorization there, " +
+            "then return to BudgetSaver."
+          );
+
+          startChecking();
+        } catch (error) {
+          popup.close();
+          throw error;
+        }
+      } catch (error) {
+        setConnectionStatus(error.message);
+      } finally {
+        connectButton.disabled = !linkingEnabled;
+      }
+    }
+
+    function displayAccounts(accounts) {
+      accountsElement.replaceChildren();
 
       if (!accounts.length) {
         const empty = document.createElement("p");
         empty.textContent =
-          "No financial accounts connected yet.";
+          "No connected accounts yet.";
         accountsElement.appendChild(empty);
         return;
       }
 
       for (const account of accounts) {
-        const container = document.createElement("div");
-        container.className = "account";
+        const row = document.createElement("div");
+        row.className = "account";
 
         const name = document.createElement("strong");
         name.textContent =
-          account.name || "Financial account";
+          account.name || "Bank account";
 
         const details = document.createElement("span");
         details.textContent = account.mask
-          ? `Account ending in ${account.mask}`
-          : "Account number unavailable";
+          ? "Account ending in " + account.mask
+          : "Account details unavailable";
 
         const balance = document.createElement("span");
+        const amount = Number(
+          account.current_balance
+        );
 
-        if (
-          account.current_balance !== null &&
-          account.current_balance !== undefined
-        ) {
-          const amount = Number(account.current_balance);
-
-          balance.textContent = Number.isFinite(amount)
+        balance.textContent =
+          account.current_balance != null &&
+          Number.isFinite(amount)
             ? amount.toLocaleString("en-US", {
                 style: "currency",
                 currency: "USD"
               })
             : "Balance unavailable";
-        } else {
-          balance.textContent = "Balance unavailable";
-        }
 
-        container.appendChild(name);
-        container.appendChild(details);
-        container.appendChild(balance);
-        accountsElement.appendChild(container);
+        const updated = document.createElement("span");
+        updated.textContent = account.updated_at
+          ? "Last recorded: " +
+            new Date(
+              account.updated_at
+            ).toLocaleString()
+          : "Not refreshed yet";
+
+        row.appendChild(name);
+        row.appendChild(details);
+        row.appendChild(balance);
+        row.appendChild(updated);
+
+        accountsElement.appendChild(row);
       }
     }
 
     async function loadAccounts() {
       if (!verified) return;
 
-      refreshButton.disabled = true;
+      try {
+        const result = await api("/api/accounts");
+        displayAccounts(result.accounts || []);
+      } catch (error) {
+        setStatus(error.message);
+      }
+    }
+
+    async function refreshAccounts() {
+      if (!verified) return;
+
+      setStatus("Updating bank balances...");
 
       try {
-        const result =
-          await apiRequest("/api/accounts");
-
-        showAccounts(result.accounts || []);
-
-        setStatus(
-          "Secure login verified. Account data loaded."
+        await api(
+          "/api/accounts/refresh",
+          {
+            method: "POST",
+            body: "{}"
+          }
         );
-      } catch (err) {
-        setStatus(err.message);
-      } finally {
-        refreshButton.disabled = false;
+
+        await loadAccounts();
+        setStatus("Account refresh completed.");
+      } catch (error) {
+        setStatus(error.message);
       }
     }
 
     async function syncTransactions() {
       if (!verified) return;
 
-      syncButton.disabled = true;
-      syncResultElement.textContent =
-        "Synchronizing transactions...";
+      setStatus("Synchronizing transactions...");
 
       try {
-        const result = await apiRequest(
+        const sync = await api(
           "/api/transactions/sync",
           {
             method: "POST",
@@ -454,297 +595,167 @@
           }
         );
 
-        const total = (result.results || []).length;
-        const failures = (result.results || [])
-          .filter(item => item.ok === false).length;
+        const failed = (sync.results || [])
+          .filter(item => item.ok === false)
+          .length;
 
-        syncResultElement.textContent =
-          `${total} connections checked, ` +
-          `${failures} failed.`;
-
-        await loadAccounts();
-      } catch (err) {
-        syncResultElement.textContent =
-          err.message;
-      } finally {
-        syncButton.disabled = false;
-      }
-    }
-
-    function openPlaid(linkToken, returning = false) {
-      if (!window.Plaid) {
-        throw new Error("Plaid Link could not load.");
-      }
-
-      if (currentHandler) {
-        try {
-          currentHandler.destroy();
-        } catch {
-          // Ignore cleanup failures.
-        }
-        currentHandler = null;
-      }
-
-      const options = {
-        token: linkToken,
-
-        onSuccess: async (publicToken, metadata) => {
-          if (
-            typeof publicToken !== "string" ||
-            !activeSessionId
-          ) {
-            setStatus(
-              "No completed banking session was received."
-            );
-            return;
-          }
-
-          try {
-            setStatus(
-              "Saving Sandbox bank connection..."
-            );
-
-            // Metadata is not treated as independent
-            // proof of session ownership.
-            await apiRequest(
-              "/api/plaid/web/exchange",
-              {
-                method: "POST",
-                body: JSON.stringify({
-                  session_id: activeSessionId,
-                  public_token: publicToken
-                })
-              }
-            );
-
-            clearSession();
-
-            setStatus(
-              "Test bank connection saved successfully."
-            );
-
-            await loadAccounts();
-          } catch (err) {
-            setStatus(err.message);
-          }
-        },
-
-        onExit: (err) => {
-          if (err) {
-            setStatus(
-              "Plaid could not complete the connection."
-            );
-          } else {
-            setStatus(
-              "Bank connection window closed."
-            );
-          }
-        },
-
-        onEvent: () => {
-          // Never log bank credentials or tokens.
-        }
-      };
-
-      if (returning) {
-        options.receivedRedirectUri =
-          window.location.href;
-      }
-
-      currentHandler =
-        window.Plaid.create(options);
-
-      currentHandler.open();
-    }
-
-    async function beginLink() {
-      if (!verified || !sandboxEnabled) {
-        setStatus(
-          "Bank linking has not been enabled."
-        );
-        return;
-      }
-
-      connectButton.disabled = true;
-
-      try {
-        setStatus(
-          "Creating secure test connection..."
+        const data = await api(
+          "/api/transactions"
         );
 
-        const result = await apiRequest(
-          "/api/plaid/web/link-token",
-          {
-            method: "POST",
-            body: "{}"
-          }
+        const transactions = data.transactions || [];
+
+        const plaidTransactions = transactions.filter(
+          item => item.source === "plaid"
         );
 
-        activeSessionId = result.session_id;
-
-        sessionStorage.setItem(
-          "bs_link_session_id",
-          activeSessionId
-        );
-
-        openPlaid(result.link_token);
-      } catch (err) {
-        setStatus(err.message);
-      } finally {
-        connectButton.disabled = !sandboxEnabled;
-      }
-    }
-
-    async function resumeOAuth() {
-      if (!isOAuthReturn || !sandboxEnabled) {
-        return;
-      }
-
-      activeSessionId =
-        sessionStorage.getItem(
-          "bs_link_session_id"
-        );
-
-      if (!activeSessionId) {
-        setStatus(
-          "The original banking session was not found. " +
-          "Open BudgetSaver and start again."
-        );
-        return;
-      }
-
-      try {
-        const response = await apiRequest(
-          "/api/plaid/web/resume",
-          {
-            method: "POST",
-            body: JSON.stringify({
-              session_id: activeSessionId
-            })
-          }
-        );
+        transactionSummary.textContent =
+          `${plaidTransactions.length} bank transactions loaded. ` +
+          `${failed} connections reported sync errors.`;
 
         setStatus(
-          "Resuming Plaid authorization..."
+          failed
+            ? "Some accounts need synchronization attention."
+            : "Transaction synchronization completed."
         );
-
-        openPlaid(response.link_token, true);
-      } catch (err) {
-        clearSession();
-        setStatus(err.message);
+      } catch (error) {
+        setStatus(error.message);
       }
     }
 
     document.getElementById("loginForm")
-      .addEventListener("submit", async event => {
-        event.preventDefault();
+      .addEventListener(
+        "submit",
+        async event => {
+          event.preventDefault();
 
-        const email =
-          document.getElementById("email").value;
+          const email = document
+            .getElementById("email").value;
 
-        const passwordElement =
-          document.getElementById("password");
+          const passwordInput = document
+            .getElementById("password");
 
-        const password = passwordElement.value;
-        passwordElement.value = "";
+          const password = passwordInput.value;
+          passwordInput.value = "";
 
-        const signInButton =
-          document.getElementById("signIn");
+          const button = document
+            .getElementById("signIn");
 
-        signInButton.disabled = true;
+          button.disabled = true;
 
-        try {
-          setStatus("Signing in...");
+          try {
+            setStatus("Signing in...");
 
-          await setPersistence(
-            auth,
-            browserLocalPersistence
-          );
+            await setPersistence(
+              auth,
+              browserLocalPersistence
+            );
 
-          await signInWithEmailAndPassword(
-            auth,
-            email,
-            password
-          );
-        } catch {
-          setStatus(
-            "Sign-in failed. Check your credentials."
-          );
-        } finally {
-          signInButton.disabled = false;
+            await signInWithEmailAndPassword(
+              auth,
+              email,
+              password
+            );
+          } catch {
+            setStatus(
+              "Sign-in failed. Check your credentials."
+            );
+          } finally {
+            button.disabled = false;
+          }
         }
-      });
+      );
 
     connectButton.addEventListener(
       "click",
-      beginLink
+      connectBank
     );
 
-    refreshButton.addEventListener(
-      "click",
-      loadAccounts
-    );
+    document.getElementById("checkStatus")
+      .addEventListener(
+        "click",
+        checkConnection
+      );
 
-    syncButton.addEventListener(
-      "click",
-      syncTransactions
-    );
+    document.getElementById("refresh")
+      .addEventListener(
+        "click",
+        refreshAccounts
+      );
+
+    document.getElementById("sync")
+      .addEventListener(
+        "click",
+        syncTransactions
+      );
 
     document.getElementById("signOut")
-      .addEventListener("click", async () => {
-        clearSession();
-        verified = false;
-        sandboxEnabled = false;
-        await signOut(auth);
-      });
+      .addEventListener(
+        "click",
+        async () => {
+          stopChecking();
+          currentSessionId = null;
+          verified = false;
+          linkingEnabled = false;
 
-    onAuthStateChanged(auth, async user => {
-      currentUser = user;
-      verified = false;
-      sandboxEnabled = false;
-      startupCompleted = false;
-
-      connectButton.disabled = true;
-
-      loginSection.classList.toggle(
-        "hidden",
-        !!user
-      );
-
-      bankSection.classList.toggle(
-        "hidden",
-        !user
-      );
-
-      if (!user) {
-        accountsElement.replaceChildren();
-        setStatus("Sign in to continue.");
-        return;
-      }
-
-      try {
-        await verifyAccount();
-        verified = true;
-
-        await loadPlaidStatus();
-
-        setStatus("Secure login verified.");
-
-        await loadAccounts();
-
-        if (isOAuthReturn && !startupCompleted) {
-          startupCompleted = true;
-          await resumeOAuth();
+          await signOut(auth);
         }
-      } catch {
+      );
+
+    document.addEventListener(
+      "visibilitychange",
+      () => {
+        if (!document.hidden && verified) {
+          checkConnection();
+        }
+      }
+    );
+
+    onAuthStateChanged(
+      auth,
+      async user => {
+        currentUser = user;
         verified = false;
+        linkingEnabled = false;
+
         connectButton.disabled = true;
 
-        setStatus(
-          "This account could not be authorized."
+        loginSection.classList.toggle(
+          "hidden",
+          !!user
         );
+
+        bankSection.classList.toggle(
+          "hidden",
+          !user
+        );
+
+        if (!user) {
+          stopChecking();
+          accountsElement.replaceChildren();
+          setStatus("Sign in to continue.");
+          return;
+        }
+
+        try {
+          await verifyLogin();
+          verified = true;
+
+          await loadPlaidStatus();
+
+          setStatus(
+            "Secure login verified."
+          );
+
+          await loadAccounts();
+          await checkConnection();
+        } catch (error) {
+          verified = false;
+          connectButton.disabled = true;
+          setStatus(error.message);
+        }
       }
-    });
+    );
   </script>
 </body>
 </html>
